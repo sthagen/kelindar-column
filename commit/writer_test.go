@@ -6,18 +6,15 @@ package commit
 import (
 	"testing"
 
-	"github.com/kelindar/bitmap"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestWriterChannel(t *testing.T) {
 	w := make(Channel, 1)
 	w.Write(Commit{
-		Type:    Delete,
-		Deletes: bitmap.Bitmap{0xff},
+		Chunk: 123,
 	})
 
 	out := <-w
-	assert.Equal(t, Delete, out.Type)
-	assert.Equal(t, bitmap.Bitmap{0xff}, out.Deletes)
+	assert.Equal(t, 123, int(out.Chunk))
 }

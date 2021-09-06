@@ -22,6 +22,7 @@ type Object = map[string]interface{}
 
 const (
 	expireColumn = "expire"
+	rowColumn    = "row"
 )
 
 // Collection represents a collection of objects in a columnar format
@@ -296,24 +297,10 @@ func (c *Collection) vacuum(ctx context.Context, interval time.Duration) {
 // Replay replays a commit on a collection, applying the changes.
 func (c *Collection) Replay(change commit.Commit) error {
 	return c.Query(func(txn *Txn) error {
-		txn.dirty = change.Dirty
-
-		// If the change contains deletes, add them to the transaction
-		if change.Is(commit.Delete) {
-			txn.deletes = change.Deletes
-		}
-
-		// If the change contains inserts, add them to the transaction
-		if change.Is(commit.Insert) {
-			txn.inserts = change.Inserts
-		}
-
-		// If the change contains updates, add them to the transaction
-		if change.Is(commit.Store) {
-			for i := range change.Updates {
-				if !change.Updates[i].IsEmpty() {
-					txn.updates = append(txn.updates, change.Updates[i])
-				}
+		txn.dirty.Set(change.Chunk)
+		for i := range change.Updates {
+			if !change.Updates[i].IsEmpty() {
+				txn.updates = append(txn.updates, change.Updates[i])
 			}
 		}
 		return nil
