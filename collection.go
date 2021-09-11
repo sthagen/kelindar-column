@@ -134,16 +134,26 @@ func (c *Collection) InsertWithTTL(obj Object, ttl time.Duration) (index uint32)
 	return
 }
 
-// UpdateAt updates a specific row/column combination and sets the value. It is also
-// possible to update during the query, which is much more convenient to use.
-func (c *Collection) UpdateAt(idx uint32, columnName string, value interface{}) {
-	c.Query(func(txn *Txn) error {
-		if cursor, err := txn.cursorFor(columnName); err == nil {
-			cursor.idx = idx
-			cursor.Set(value)
-		}
-		return nil
+// UpdateAt updates a specific row by initiating a separate transaction for the update.
+func (c *Collection) UpdateAt(idx uint32, columnName string, fn func(v Cursor) error) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.UpdateAt(idx, columnName, fn)
 	})
+}
+
+// SelectAt performs a selection on a specific row specified by its index. It returns
+// a boolean value indicating whether an element is present at the index or not.
+func (c *Collection) SelectAt(idx uint32, fn func(v Selector)) bool {
+	chunk := uint(idx >> chunkShift)
+	if idx >= uint32(len(c.fill))<<6 || !c.fill.Contains(idx) {
+		return false
+	}
+
+	// Lock the chunk which we are about to read and call the selector delegate
+	c.slock.RLock(chunk)
+	fn(Selector{idx: idx, col: c})
+	c.slock.RUnlock(chunk)
+	return true
 }
 
 // DeleteAt attempts to delete an item at the specified index for this collection. If the item
@@ -188,18 +198,19 @@ func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader)
 		return fmt.Errorf("column: create index must specify name, column and function")
 	}
 
+	// Prior to creating an index, we should have a column
+	column, ok := c.cols.Load(columnName)
+	if !ok {
+		return fmt.Errorf("column: unable to create index, column '%v' does not exist", columnName)
+	}
+
 	// Create and add the index column,
 	index := newIndex(indexName, columnName, fn)
 	c.lock.Lock()
 	index.Grow(uint32(c.size))
 	c.cols.Store(indexName, index)
-	c.cols.Store(columnName, nil, index)
+	c.cols.Store(columnName, column, index)
 	c.lock.Unlock()
-
-	// If the colum does not yet exist, nothing else to do
-	if _, ok := c.cols.Load(columnName); !ok {
-		return nil
-	}
 
 	// If a column with this name already exists, iterate through all of the values
 	// that we have in the collection and apply the filter.
@@ -213,35 +224,21 @@ func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader)
 
 // DropIndex removes the index column with the specified name. If the index with this
 // name does not exist, this operation is a no-op.
-func (c *Collection) DropIndex(indexName string) {
+func (c *Collection) DropIndex(indexName string) error {
+	column, exists := c.cols.Load(indexName)
+	if !exists {
+		return fmt.Errorf("column: unable to drop index, index '%v' does not exist", indexName)
+	}
 
-	// Get the specified index to drop
-	column, _ := c.cols.Load(indexName)
 	if _, ok := column.Column.(computed); !ok {
-		return
+		return fmt.Errorf("column: unable to drop index, '%v' is not an index", indexName)
 	}
 
 	// Figure out the associated column and delete the index from that
 	columnName := column.Column.(computed).Column()
 	c.cols.DeleteIndex(columnName, indexName)
 	c.cols.DeleteColumn(indexName)
-}
-
-// Fetch retrieves an object by its handle and returns a Selector for it.
-func (c *Collection) Fetch(idx uint32) (Selector, bool) {
-	c.lock.RLock()
-	contains := c.fill.Contains(idx)
-	c.lock.RUnlock()
-
-	// If it's empty or over the sequence, not found
-	if idx >= uint32(len(c.fill))<<6 || !contains {
-		return Selector{}, false
-	}
-
-	return Selector{
-		idx: idx,
-		col: c,
-	}, true
+	return nil
 }
 
 // Query creates a transaction which allows for filtering and iteration over the
@@ -406,11 +403,7 @@ func (c *columns) DeleteColumn(columnName string) {
 
 // Delete deletes a column from the registry.
 func (c *columns) DeleteIndex(columnName, indexName string) {
-	index, ok := c.Load(indexName)
-	if !ok {
-		return
-	}
-
+	index, _ := c.Load(indexName)
 	columns := c.cols.Load().([]columnEntry)
 	for i, v := range columns {
 		if v.name != columnName {

@@ -1,43 +1,65 @@
 # Concurrency Benchmark
 
 This is an example benchmark with various workloads (90% read / 10% write, etc) on a collection of 1 million elements with different goroutine pools. In this example we're combining two types of transactions:
- * Read transactions that query a random index and iterate over the results over a single column.
+ * Read transactions that update a random element (point-read).
  * Write transactions that update a random element (point-write).
 
 Note that the goal of this benchmark is to validate concurrency, not throughput this represents the current "best" case scenario when the updates are random and do less likely to incur contention. Reads, however quite often would hit the same chunks as only the index itself is randomized.
 
+## Results
+
+Below are some results from running on my 8-core machine (Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz).
+
 ```
-90%-10%       1 procs      249,208,310 read/s        117 write/s
-90%-10%       8 procs    1,692,667,386 read/s        738 write/s
-90%-10%      16 procs    1,509,926,215 read/s        635 write/s
-90%-10%      32 procs    1,489,456,934 read/s        660 write/s
-90%-10%      64 procs    1,533,053,898 read/s        666 write/s
-90%-10%     128 procs    1,495,078,423 read/s        654 write/s
-90%-10%     256 procs    1,443,437,689 read/s        656 write/s
-90%-10%     512 procs    1,464,321,958 read/s        704 write/s
-90%-10%    1024 procs    1,495,877,020 read/s        635 write/s
-90%-10%    2048 procs    1,413,233,904 read/s        658 write/s
-90%-10%    4096 procs    1,376,644,077 read/s        743 write/s
-50%-50%       1 procs      236,528,133 read/s        861 write/s
-50%-50%       8 procs    1,589,501,618 read/s      6,335 write/s
-50%-50%      16 procs    1,607,166,585 read/s      6,484 write/s
-50%-50%      32 procs    1,575,200,925 read/s      6,438 write/s
-50%-50%      64 procs    1,432,978,587 read/s      5,808 write/s
-50%-50%     128 procs    1,181,986,760 read/s      4,606 write/s
-50%-50%     256 procs    1,529,174,062 read/s      6,180 write/s
-50%-50%     512 procs    1,472,102,974 read/s      5,961 write/s
-50%-50%    1024 procs    1,399,040,792 read/s      6,066 write/s
-50%-50%    2048 procs    1,295,570,830 read/s      5,919 write/s
-50%-50%    4096 procs    1,181,556,697 read/s      5,871 write/s
-10%-90%       1 procs      199,670,671 read/s      7,119 write/s
-10%-90%       8 procs    1,224,172,050 read/s     44,464 write/s
-10%-90%      16 procs    1,317,755,536 read/s     46,451 write/s
-10%-90%      32 procs    1,429,807,620 read/s     51,758 write/s
-10%-90%      64 procs    1,413,067,976 read/s     51,304 write/s
-10%-90%     128 procs    1,302,410,992 read/s     46,375 write/s
-10%-90%     256 procs    1,223,553,655 read/s     45,110 write/s
-10%-90%     512 procs    1,120,740,609 read/s     42,799 write/s
-10%-90%    1024 procs    1,071,064,037 read/s     41,519 write/s
-10%-90%    2048 procs    1,044,805,034 read/s     42,868 write/s
-10%-90%    4096 procs      877,312,822 read/s     42,910 write/s
+   WORK  PROCS          READ RATE          WRITE RATE
+100%-0%      1    8,149,482 txn/s             0 txn/s
+100%-0%      2   12,622,747 txn/s             0 txn/s
+100%-0%      4   14,378,647 txn/s             0 txn/s
+100%-0%      8   16,298,860 txn/s             0 txn/s
+100%-0%     16   16,276,835 txn/s             0 txn/s
+100%-0%     32   16,297,247 txn/s             0 txn/s
+100%-0%     64   16,214,731 txn/s             0 txn/s
+100%-0%    128   16,185,721 txn/s             0 txn/s
+100%-0%    256   16,171,638 txn/s             0 txn/s
+100%-0%    512   16,237,574 txn/s             0 txn/s
+90%-10%      1    2,248,513 txn/s       239,309 txn/s
+90%-10%      2    2,297,998 txn/s       226,016 txn/s
+90%-10%      4    1,432,691 txn/s       184,189 txn/s
+90%-10%      8    1,112,076 txn/s       153,934 txn/s
+90%-10%     16    1,432,723 txn/s       147,244 txn/s
+90%-10%     32    1,375,383 txn/s       161,755 txn/s
+90%-10%     64    1,441,755 txn/s       144,570 txn/s
+90%-10%    128    1,272,174 txn/s       140,107 txn/s
+90%-10%    256      925,191 txn/s       105,999 txn/s
+90%-10%    512      858,555 txn/s        89,202 txn/s
+50%-50%      1      305,245 txn/s       320,159 txn/s
+50%-50%      2      262,496 txn/s       250,654 txn/s
+50%-50%      4      255,906 txn/s       262,823 txn/s
+50%-50%      8      238,096 txn/s       225,565 txn/s
+50%-50%     16      236,144 txn/s       240,810 txn/s
+50%-50%     32      250,954 txn/s       237,928 txn/s
+50%-50%     64      214,474 txn/s       220,495 txn/s
+50%-50%    128      156,660 txn/s       162,219 txn/s
+50%-50%    256      125,956 txn/s       120,344 txn/s
+50%-50%    512      103,619 txn/s        98,510 txn/s
+10%-90%      1       40,723 txn/s       339,694 txn/s
+10%-90%      2       24,746 txn/s       298,934 txn/s
+10%-90%      4       35,483 txn/s       290,769 txn/s
+10%-90%      8       34,265 txn/s       279,838 txn/s
+10%-90%     16       28,678 txn/s       274,759 txn/s
+10%-90%     32       23,662 txn/s       227,651 txn/s
+10%-90%     64       36,056 txn/s       208,993 txn/s
+10%-90%    128       17,463 txn/s       149,558 txn/s
+10%-90%    256       14,125 txn/s       113,701 txn/s
+10%-90%    512       11,435 txn/s        96,999 txn/s
+0%-100%      1            0 txn/s       345,335 txn/s
+0%-100%      2            0 txn/s       297,386 txn/s
+0%-100%      4            0 txn/s       300,023 txn/s
+0%-100%      8            0 txn/s       276,361 txn/s
+0%-100%     16            0 txn/s       243,448 txn/s
+0%-100%     32            0 txn/s       208,523 txn/s
+0%-100%     64            0 txn/s       195,732 txn/s
+0%-100%    128            0 txn/s       145,990 txn/s
+0%-100%    256            0 txn/s       110,786 txn/s
+0%-100%    512            0 txn/s        94,313 txn/s
 ```

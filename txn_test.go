@@ -130,11 +130,8 @@ func TestIndexInvalid(t *testing.T) {
 	}))
 
 	players.Query(func(txn *Txn) error {
-		_, ok := txn.ReadAt(999999)
-		assert.False(t, ok)
-
-		_, ok = txn.ReadAt(0)
-		assert.True(t, ok)
+		assert.False(t, txn.SelectAt(999999, func(v Selector) {}))
+		assert.True(t, txn.SelectAt(0, func(v Selector) {}))
 		return nil
 	})
 
@@ -467,5 +464,32 @@ func TestUninitializedSet(t *testing.T) {
 				v.SetStringAt("col3", a[0].(string))
 			}
 		})
+	}))
+}
+
+func TestUpdateAt(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("col1", ForString())
+	index := c.Insert(map[string]interface{}{
+		"col1": "hello",
+	})
+
+	assert.NoError(t, c.UpdateAt(index, "col1", func(v Cursor) error {
+		v.Set("hi")
+		return nil
+	}))
+
+	assert.True(t, c.SelectAt(index, func(v Selector) {
+		assert.Equal(t, "hi", v.StringAt("col1"))
+	}))
+}
+
+func TestUpdateAtInvalid(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("col1", ForString())
+
+	assert.Error(t, c.UpdateAt(0, "col2", func(v Cursor) error {
+		v.SetString("hi")
+		return nil
 	}))
 }
