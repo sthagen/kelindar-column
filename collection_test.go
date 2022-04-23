@@ -7,8 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
-	"math/rand"
 	"os"
 	"runtime"
 	"sync"
@@ -16,24 +14,25 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kelindar/async"
-	"github.com/kelindar/column/commit"
 	"github.com/stretchr/testify/assert"
 )
 
 /*
 cpu: Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz
-BenchmarkCollection/insert-8         	    2167	    578821 ns/op	    1223 B/op	       1 allocs/op
-BenchmarkCollection/select-at-8      	42703713	        27.72 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/scan-8           	    2032	    598751 ns/op	      49 B/op	       0 allocs/op
-BenchmarkCollection/count-8          	  800036	      1498 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/range-8          	   16833	     70556 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/update-at-8      	 3689354	       323.6 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/update-all-8     	    1198	   1003934 ns/op	    4004 B/op	       0 allocs/op
-BenchmarkCollection/delete-at-8      	 8071692	       145.7 ns/op	       0 B/op	       0 allocs/op
-BenchmarkCollection/delete-all-8     	 2328974	       494.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/insert-8         	    2523	    469481 ns/op	   24356 B/op	     500 allocs/op
+BenchmarkCollection/select-at-8      	22194190	        54.23 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/scan-8           	    2068	    568953 ns/op	     122 B/op	       0 allocs/op
+BenchmarkCollection/count-8          	  571449	      2057 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/range-8          	   28660	     41695 ns/op	       3 B/op	       0 allocs/op
+BenchmarkCollection/update-at-8      	 5911978	       202.8 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/update-all-8     	    1280	    946272 ns/op	    3726 B/op	       0 allocs/op
+BenchmarkCollection/delete-at-8      	 6405852	       188.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCollection/delete-all-8     	 2073188	       562.6 ns/op	       0 B/op	       0 allocs/op
 */
 func BenchmarkCollection(b *testing.B) {
+	amount := 100000
+	players := loadPlayers(amount)
+
 	b.Run("insert", func(b *testing.B) {
 		temp := loadPlayers(500)
 		data := loadFixture("players.json")
@@ -49,22 +48,21 @@ func BenchmarkCollection(b *testing.B) {
 
 			temp.Query(func(txn *Txn) error {
 				for _, p := range data {
-					txn.Insert(p)
+					txn.InsertObject(p)
 				}
 				return nil
 			})
 		}
 	})
 
-	amount := 100000
-	players := loadPlayers(amount)
 	b.Run("select-at", func(b *testing.B) {
 		name := ""
 		b.ReportAllocs()
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
-			players.SelectAt(20, func(v Selector) {
-				name = v.StringAt("name")
+			players.QueryAt(20, func(r Row) error {
+				name, _ = r.Enum("name")
+				return nil
 			})
 		}
 		assert.NotEmpty(b, name)
@@ -104,9 +102,10 @@ func BenchmarkCollection(b *testing.B) {
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
 			players.Query(func(txn *Txn) error {
-				txn.With("human", "mage", "old").Range("name", func(v Cursor) {
+				names := txn.Enum("name")
+				txn.With("human", "mage", "old").Range(func(idx uint32) {
 					count++
-					name = v.String()
+					name, _ = names.Get()
 				})
 				return nil
 			})
@@ -118,8 +117,8 @@ func BenchmarkCollection(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
-			players.UpdateAt(20, "balance", func(v Cursor) error {
-				v.Set(1.0)
+			players.QueryAt(20, func(r Row) error {
+				r.SetFloat64("balance", 1.0)
 				return nil
 			})
 		}
@@ -130,10 +129,10 @@ func BenchmarkCollection(b *testing.B) {
 		b.ResetTimer()
 		for n := 0; n < b.N; n++ {
 			players.Query(func(txn *Txn) error {
-				txn.Range("balance", func(v Cursor) {
-					v.SetFloat64(0.0)
+				balance := txn.Float64("balance")
+				return txn.Range(func(idx uint32) {
+					balance.Set(0.0)
 				})
-				return nil
 			})
 		}
 	})
@@ -159,118 +158,6 @@ func BenchmarkCollection(b *testing.B) {
 	})
 }
 
-// Test replication many times
-func TestReplicate(t *testing.T) {
-	for x := 0; x < 20; x++ {
-		rand.Seed(int64(x))
-		runReplication(t, 10000, 50, runtime.NumCPU())
-	}
-}
-
-// runReplication runs a concurrent replication test
-func runReplication(t *testing.T, updates, inserts, concurrency int) {
-	t.Run(fmt.Sprintf("replicate-%v-%v", updates, inserts), func(t *testing.T) {
-		writer := make(commit.Channel, 10)
-		object := map[string]interface{}{
-			"float64": float64(0),
-			"int32":   int32(0),
-			"string":  "",
-		}
-
-		// Create a primary
-		primary := NewCollection(Options{
-			Capacity: inserts,
-			Writer:   &writer,
-		})
-		// Replica with the same schema
-		replica := NewCollection(Options{
-			Capacity: inserts,
-		})
-
-		// Create schemas and start streaming replication into the replica
-		primary.CreateColumnsOf(object)
-		replica.CreateColumnsOf(object)
-		var done sync.WaitGroup
-		done.Add(1)
-		go func() {
-			defer done.Done() // Drained
-			for change := range writer {
-				assert.NoError(t, replica.Replay(change))
-			}
-		}()
-
-		// Write some objects
-		for i := 0; i < inserts; i++ {
-			primary.Insert(object)
-		}
-
-		work := make(chan async.Task)
-		pool := async.Consume(context.Background(), 50, work)
-		defer pool.Cancel()
-
-		// Random concurrent updates
-		var wg sync.WaitGroup
-		wg.Add(updates)
-		for i := 0; i < updates; i++ {
-			work <- async.NewTask(func(ctx context.Context) (interface{}, error) {
-				defer wg.Done()
-
-				// Randomly update a column
-				offset := uint32(rand.Int31n(int32(inserts - 1)))
-				primary.UpdateAt(offset, "float64", func(v Cursor) error {
-					switch rand.Int31n(3) {
-					case 0:
-						v.SetFloat64(math.Round(rand.Float64()*1000) / 100)
-					case 1:
-						v.SetInt32At("int32", rand.Int31n(100000))
-					case 2:
-						v.SetStringAt("string", fmt.Sprintf("hi %v", rand.Int31n(10)))
-					}
-					return nil
-				})
-
-				// Randomly delete an item
-				if rand.Int31n(5) == 0 {
-					primary.DeleteAt(uint32(rand.Int31n(int32(inserts - 1))))
-				}
-
-				// Randomly insert an item
-				if rand.Int31n(5) == 0 {
-					primary.Insert(object)
-				}
-				return nil, nil
-			})
-		}
-
-		// Replay all of the changes into the replica
-		wg.Wait()
-		close(writer)
-		done.Wait()
-
-		// Check if replica and primary are the same
-		if !assert.Equal(t, primary.Count(), replica.Count(), "replica and primary should be the same size") {
-			return
-		}
-
-		primary.Query(func(txn *Txn) error {
-			return txn.Range("float64", func(v Cursor) {
-				v1, v2 := v.FloatAt("float64"), v.IntAt("int32")
-				if v1 != 0 {
-					assert.True(t, txn.SelectAt(v.idx, func(s Selector) {
-						assert.Equal(t, v.FloatAt("float64"), s.FloatAt("float64"))
-					}))
-				}
-
-				if v2 != 0 {
-					assert.True(t, txn.SelectAt(v.idx, func(s Selector) {
-						assert.Equal(t, v.IntAt("int32"), s.IntAt("int32"))
-					}))
-				}
-			})
-		})
-	})
-}
-
 func TestCollection(t *testing.T) {
 	obj := Object{
 		"name":   "Roman",
@@ -282,68 +169,109 @@ func TestCollection(t *testing.T) {
 
 	col := NewCollection()
 	col.CreateColumnsOf(obj)
-	idx := col.Insert(obj)
+	idx := col.InsertObject(obj)
+	assert.Equal(t, uint32(0), idx)
+	assert.Equal(t, uint32(1), col.InsertObject(obj))
 
 	// Should not drop, since it's not an index
-	col.DropIndex("name")
+	assert.Error(t, col.DropIndex("name"))
 
-	// Create a coupe of indices
+	// Create a couple of indexes
 	assert.Error(t, col.CreateIndex("", "", nil))
 	assert.NoError(t, col.CreateIndex("rich", "wallet", func(r Reader) bool {
 		return r.Float() > 100
 	}))
 
 	{ // Find the object by its index
-		assert.True(t, col.SelectAt(idx, func(v Selector) {
-			assert.Equal(t, "Roman", v.StringAt("name"))
+		assert.NoError(t, col.QueryAt(idx, func(r Row) error {
+			name, ok := r.String("name")
+			assert.True(t, ok)
+			assert.Equal(t, "Roman", name)
+			return nil
 		}))
 	}
 
 	{ // Remove the object
-		col.DeleteAt(idx)
-		assert.False(t, col.SelectAt(idx, func(v Selector) {
-			assert.Fail(t, "unreachable")
+		assert.True(t, col.DeleteAt(idx))
+		assert.Error(t, col.QueryAt(idx, func(r Row) error {
+			if _, ok := r.String("name"); !ok {
+				return fmt.Errorf("unreachable")
+			}
+
+			return nil
 		}))
 	}
 
 	{ // Add a new one, should replace
-		idx := col.Insert(obj)
-		assert.True(t, col.SelectAt(idx, func(v Selector) {
-			assert.Equal(t, "Roman", v.StringAt("name"))
+		newIdx := col.InsertObject(obj)
+		assert.Equal(t, idx, newIdx)
+		assert.NoError(t, col.QueryAt(newIdx, func(r Row) error {
+			name, ok := r.String("name")
+			assert.True(t, ok)
+			assert.Equal(t, "Roman", name)
+			return nil
 		}))
 	}
 
 	{ // Update the wallet
-		col.UpdateAt(idx, "wallet", func(v Cursor) error {
-			v.SetFloat64(1000)
+		col.QueryAt(idx, func(r Row) error {
+			r.SetFloat64("wallet", 1000)
 			return nil
 		})
-		assert.True(t, col.SelectAt(idx, func(v Selector) {
-			assert.Equal(t, int64(1000), v.IntAt("wallet"))
-			assert.Equal(t, true, v.BoolAt("rich"))
+
+		col.QueryAt(idx, func(r Row) error {
+			wallet, ok := r.Float64("wallet")
+			isRich := r.Bool("rich")
+
+			assert.True(t, ok)
+			assert.Equal(t, 1000.0, wallet)
+			assert.True(t, isRich)
+			return nil
+		})
+
+		assert.NoError(t, col.QueryAt(idx, func(r Row) error {
+			wallet, _ := r.Float64("wallet")
+			isRich := r.Bool("rich")
+
+			assert.Equal(t, 1000.0, wallet)
+			assert.True(t, isRich)
+			return nil
 		}))
 	}
+}
 
-	{ // Drop the colun
-		col.DropColumn("rich")
-		col.Query(func(txn *Txn) error {
-			assert.Equal(t, 0, txn.With("rich").Count())
-			return nil
-		})
+func TestDropColumn(t *testing.T) {
+	obj := Object{
+		"wallet": 5000,
 	}
+
+	col := NewCollection()
+	col.CreateColumnsOf(obj)
+	assert.NoError(t, col.CreateIndex("rich", "wallet", func(r Reader) bool {
+		return r.Float() > 100
+	}))
+
+	assert.Equal(t, uint32(0), col.InsertObject(obj))
+	assert.Equal(t, uint32(1), col.InsertObject(obj))
+
+	col.DropColumn("rich")
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 0, txn.With("rich").Count())
+		return nil
+	})
 }
 
 func TestInsertObject(t *testing.T) {
 	col := NewCollection()
 	col.CreateColumn("name", ForString())
-	col.Insert(Object{"name": "A"})
-	col.Insert(Object{"name": "B"})
+	col.InsertObject(Object{"name": "A"})
+	col.InsertObject(Object{"name": "B"})
 
 	assert.Equal(t, 2, col.Count())
-	assert.NoError(t, col.Query(func(txn *Txn) error {
-		assert.True(t, txn.SelectAt(0, func(v Selector) {
-			assert.Equal(t, "A", v.StringAt("name"))
-		}))
+	assert.NoError(t, col.QueryAt(0, func(r Row) error {
+		name, ok := r.String("name")
+		assert.True(t, ok)
+		assert.Equal(t, "A", name)
 		return nil
 	}))
 }
@@ -364,11 +292,13 @@ func TestExpire(t *testing.T) {
 	defer col.Close()
 
 	// Insert an object
-	col.InsertWithTTL(obj, time.Microsecond)
+	col.InsertObjectWithTTL(obj, time.Microsecond)
 	col.Query(func(txn *Txn) error {
-		return txn.Range(expireColumn, func(v Cursor) {
-			expireAt := time.Unix(0, int64(v.Int()))
-			v.SetInt64(expireAt.Add(1 * time.Microsecond).UnixNano())
+		expire := txn.Int64(expireColumn)
+		return txn.Range(func(idx uint32) {
+			value, _ := expire.Get()
+			expireAt := time.Unix(0, value)
+			expire.Set(expireAt.Add(1 * time.Microsecond).UnixNano())
 		})
 	})
 	assert.Equal(t, 1, col.Count())
@@ -389,14 +319,14 @@ func TestCreateIndex(t *testing.T) {
 	// Create a collection with 1 row
 	col := NewCollection()
 	col.CreateColumnsOf(row)
-	col.Insert(row)
+	col.InsertObject(row)
 	defer col.Close()
 
 	// Create an index, add 1 more row
 	assert.NoError(t, col.CreateIndex("young", "age", func(r Reader) bool {
 		return r.Int() < 50
 	}))
-	col.Insert(row)
+	col.InsertObject(row)
 
 	// We now should have 2 rows in the index
 	col.Query(func(txn *Txn) error {
@@ -422,7 +352,7 @@ func TestDropIndex(t *testing.T) {
 	// Create a collection with 1 row
 	col := NewCollection()
 	col.CreateColumnsOf(row)
-	col.Insert(row)
+	col.InsertObject(row)
 	defer col.Close()
 
 	// Create an index
@@ -478,7 +408,7 @@ func TestInsertParallel(t *testing.T) {
 	wg.Add(500)
 	for i := 0; i < 500; i++ {
 		go func() {
-			col.Insert(obj)
+			col.InsertObject(obj)
 			wg.Done()
 		}()
 	}
@@ -503,7 +433,7 @@ func TestConcurrentPointReads(t *testing.T) {
 	col := NewCollection()
 	col.CreateColumnsOf(obj)
 	for i := 0; i < 1000; i++ {
-		col.Insert(obj)
+		col.InsertObject(obj)
 	}
 
 	var ops int64
@@ -513,8 +443,9 @@ func TestConcurrentPointReads(t *testing.T) {
 	// Reader
 	go func() {
 		for i := 0; i < 10000; i++ {
-			col.SelectAt(99, func(v Selector) {
-				_ = v.StringAt("name")
+			col.QueryAt(99, func(r Row) error {
+				_, _ = r.String("name")
+				return nil
 			})
 			atomic.AddInt64(&ops, 1)
 			runtime.Gosched()
@@ -525,8 +456,8 @@ func TestConcurrentPointReads(t *testing.T) {
 	// Writer
 	go func() {
 		for i := 0; i < 10000; i++ {
-			col.UpdateAt(99, "name", func(v Cursor) error {
-				v.SetString("test")
+			col.QueryAt(99, func(r Row) error {
+				r.SetString("name", "test")
 				return nil
 			})
 			atomic.AddInt64(&ops, 1)
@@ -539,16 +470,97 @@ func TestConcurrentPointReads(t *testing.T) {
 	assert.Equal(t, 20000, int(atomic.LoadInt64(&ops)))
 }
 
+func TestInsert(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("name", ForString())
+
+	idx, err := c.Insert(func(r Row) error {
+		r.SetString("name", "Roman")
+		return nil
+	})
+	assert.Equal(t, uint32(0), idx)
+	assert.NoError(t, err)
+}
+
+func TestInsertWithTTL(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("name", ForString())
+
+	idx, err := c.InsertWithTTL(time.Hour, func(r Row) error {
+		r.SetString("name", "Roman")
+		return nil
+	})
+	assert.Equal(t, uint32(0), idx)
+	assert.NoError(t, err)
+	assert.NoError(t, c.QueryAt(idx, func(r Row) error {
+		expire, ok := r.Int64(expireColumn)
+		assert.True(t, ok)
+		assert.NotZero(t, expire)
+		return nil
+	}))
+}
+
+func TestCreateColumnsOfInvalidKind(t *testing.T) {
+	obj := map[string]interface{}{
+		"name": complex64(1),
+	}
+
+	col := NewCollection()
+	assert.Error(t, col.CreateColumnsOf(obj))
+}
+
+func TestCreateColumnsOfDuplicate(t *testing.T) {
+	obj := map[string]interface{}{
+		"name": "Roman",
+	}
+
+	col := NewCollection()
+	assert.NoError(t, col.CreateColumnsOf(obj))
+	assert.Error(t, col.CreateColumnsOf(obj))
+}
+
+func TestFindFreeIndex(t *testing.T) {
+	col := NewCollection()
+	assert.NoError(t, col.CreateColumn("name", ForString()))
+	for i := 0; i < 100; i++ {
+		idx, err := col.Insert(func(r Row) error {
+			r.SetString("name", "Roman")
+			return nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, i, int(idx))
+	}
+}
+
+// --------------------------- Mocks & Fixtures ----------------------------
+
 // loadPlayers loads a list of players from the fixture
 func loadPlayers(amount int) *Collection {
+	out := newEmpty(amount)
+
+	// Load and copy until we reach the amount required
+	data := loadFixture("players.json")
+	for i := 0; i < amount/len(data); i++ {
+		out.Query(func(txn *Txn) error {
+			for _, p := range data {
+				txn.InsertObject(p)
+			}
+			return nil
+		})
+	}
+	return out
+}
+
+// newEmpty creates a new empty collection for a the fixture
+func newEmpty(capacity int) *Collection {
 	out := NewCollection(Options{
-		Capacity: amount,
+		Capacity: capacity,
 		Vacuum:   500 * time.Millisecond,
 		Writer:   new(noopWriter),
 	})
 
 	// Load the items into the collection
-	out.CreateColumn("serial", ForEnum())
+	out.CreateColumn("serial", ForKey())
 	out.CreateColumn("name", ForEnum())
 	out.CreateColumn("active", ForBool())
 	out.CreateColumn("class", ForEnum())
@@ -591,16 +603,6 @@ func loadPlayers(amount int) *Collection {
 		return r.Float() >= 30
 	})
 
-	// Load and copy until we reach the amount required
-	data := loadFixture("players.json")
-	for i := 0; i < amount/len(data); i++ {
-		out.Query(func(txn *Txn) error {
-			for _, p := range data {
-				txn.Insert(p)
-			}
-			return nil
-		})
-	}
 	return out
 }
 
@@ -617,15 +619,4 @@ func loadFixture(name string) []Object {
 	}
 
 	return data
-}
-
-// noopWriter is a writer that simply counts the commits
-type noopWriter struct {
-	commits uint64
-}
-
-// Write clones the commit and writes it into the writer
-func (w *noopWriter) Write(commit commit.Commit) error {
-	atomic.AddUint64(&w.commits, 1)
-	return nil
 }

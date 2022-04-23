@@ -4,12 +4,17 @@
 package column
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/kelindar/bitmap"
 	"github.com/kelindar/column/commit"
+)
+
+var (
+	errNoKey = errors.New("column: collection does not have a key column")
 )
 
 // --------------------------- Pool of Transactions ----------------------------
@@ -45,9 +50,8 @@ func newTxnPool() *txnPool {
 func (p *txnPool) acquire(owner *Collection) *Txn {
 	txn := p.txns.Get().(*Txn)
 	txn.owner = owner
-	txn.writer = owner.writer
-	txn.index.Grow(uint32(owner.size))
-	owner.fill.Clone(&txn.index)
+	txn.logger = owner.logger
+	txn.setup = false
 	return txn
 }
 
@@ -73,12 +77,14 @@ func (p *txnPool) releasePage(buffer *commit.Buffer) {
 
 // Txn represents a transaction which supports filtering and projection.
 type Txn struct {
+	cursor  uint32           // The current cursor
+	setup   bool             // Whether the transaction was set up or not
 	owner   *Collection      // The target collection
 	index   bitmap.Bitmap    // The filtering index
 	dirty   bitmap.Bitmap    // The dirty chunks
 	updates []*commit.Buffer // The update buffers
 	columns []columnCache    // The column mapping
-	writer  commit.Writer    // The optional commit writer
+	logger  commit.Logger    // The optional commit logger
 	reader  *commit.Reader   // The commit reader to re-use
 }
 
@@ -94,11 +100,25 @@ func (txn *Txn) reset() {
 	txn.updates = txn.updates[:0]
 }
 
+// bufferFor loads or creates a buffer for a given column.
+func (txn *Txn) bufferFor(columnName string) *commit.Buffer {
+	for _, c := range txn.updates {
+		if c.Column == columnName {
+			return c
+		}
+	}
+
+	// Create a new buffer
+	buffer := txn.owner.txns.acquirePage(columnName)
+	txn.updates = append(txn.updates, buffer)
+	return buffer
+}
+
 // columnCache caches a column by its name. This speeds things up since it's a very
 // common operation.
 type columnCache struct {
 	name string  // The column name
-	col  *column // The columns and its computed
+	col  *column // The loaded column
 }
 
 // columnAt loads and caches the column for the transaction
@@ -125,9 +145,10 @@ func (txn *Txn) columnAt(columnName string) (*column, bool) {
 
 // With applies a logical AND operation to the current query and the specified index.
 func (txn *Txn) With(columns ...string) *Txn {
+	txn.initialize()
 	for _, columnName := range columns {
 		if idx, ok := txn.columnAt(columnName); ok {
-			txn.rangeReadPair(*idx.Column.Index(), func(dst, src bitmap.Bitmap) {
+			txn.rangeReadPair(idx, func(dst, src bitmap.Bitmap) {
 				dst.And(src)
 			})
 		} else {
@@ -139,9 +160,10 @@ func (txn *Txn) With(columns ...string) *Txn {
 
 // Without applies a logical AND NOT operation to the current query and the specified index.
 func (txn *Txn) Without(columns ...string) *Txn {
+	txn.initialize()
 	for _, columnName := range columns {
 		if idx, ok := txn.columnAt(columnName); ok {
-			txn.rangeReadPair(*idx.Column.Index(), func(dst, src bitmap.Bitmap) {
+			txn.rangeReadPair(idx, func(dst, src bitmap.Bitmap) {
 				dst.AndNot(src)
 			})
 		}
@@ -151,9 +173,10 @@ func (txn *Txn) Without(columns ...string) *Txn {
 
 // Union computes a union between the current query and the specified index.
 func (txn *Txn) Union(columns ...string) *Txn {
+	txn.initialize()
 	for _, columnName := range columns {
 		if idx, ok := txn.columnAt(columnName); ok {
-			txn.rangeReadPair(*idx.Column.Index(), func(dst, src bitmap.Bitmap) {
+			txn.rangeReadPair(idx, func(dst, src bitmap.Bitmap) {
 				dst.Or(src)
 			})
 		}
@@ -164,6 +187,7 @@ func (txn *Txn) Union(columns ...string) *Txn {
 // WithValue applies a filter predicate over values for a specific properties. It filters
 // down the items in the query.
 func (txn *Txn) WithValue(column string, predicate func(v interface{}) bool) *Txn {
+	txn.initialize()
 	c, ok := txn.columnAt(column)
 	if !ok {
 		txn.index.Clear()
@@ -184,6 +208,7 @@ func (txn *Txn) WithValue(column string, predicate func(v interface{}) bool) *Tx
 // WithFloat filters down the values based on the specified predicate. The column for
 // this filter must be numerical and convertible to float64.
 func (txn *Txn) WithFloat(column string, predicate func(v float64) bool) *Txn {
+	txn.initialize()
 	c, ok := txn.columnAt(column)
 	if !ok || !c.IsNumeric() {
 		txn.index.Clear()
@@ -199,6 +224,7 @@ func (txn *Txn) WithFloat(column string, predicate func(v float64) bool) *Txn {
 // WithInt filters down the values based on the specified predicate. The column for
 // this filter must be numerical and convertible to int64.
 func (txn *Txn) WithInt(column string, predicate func(v int64) bool) *Txn {
+	txn.initialize()
 	c, ok := txn.columnAt(column)
 	if !ok || !c.IsNumeric() {
 		txn.index.Clear()
@@ -214,6 +240,7 @@ func (txn *Txn) WithInt(column string, predicate func(v int64) bool) *Txn {
 // WithUint filters down the values based on the specified predicate. The column for
 // this filter must be numerical and convertible to uint64.
 func (txn *Txn) WithUint(column string, predicate func(v uint64) bool) *Txn {
+	txn.initialize()
 	c, ok := txn.columnAt(column)
 	if !ok || !c.IsNumeric() {
 		txn.index.Clear()
@@ -229,6 +256,7 @@ func (txn *Txn) WithUint(column string, predicate func(v uint64) bool) *Txn {
 // WithString filters down the values based on the specified predicate. The column for
 // this filter must be a string.
 func (txn *Txn) WithString(column string, predicate func(v string) bool) *Txn {
+	txn.initialize()
 	c, ok := txn.columnAt(column)
 	if !ok || !c.IsTextual() {
 		txn.index.Clear()
@@ -243,29 +271,31 @@ func (txn *Txn) WithString(column string, predicate func(v string) bool) *Txn {
 
 // Count returns the number of objects matching the query
 func (txn *Txn) Count() int {
+	txn.initialize()
 	return int(txn.index.Count())
 }
 
-// UpdateAt creates a cursor to a specific element that can be read or updated.
-func (txn *Txn) UpdateAt(index uint32, columnName string, fn func(v Cursor) error) error {
-	cursor, err := txn.cursorFor(columnName)
-	if err != nil {
-		return err
+// QueryKey jumps at a particular key in the collection, sets the cursor to the
+// provided position and executes given callback fn.
+func (txn *Txn) QueryKey(key string, fn func(Row) error) error {
+	if txn.owner.pk == nil {
+		return errNoKey
 	}
 
-	cursor.idx = index
-	return fn(cursor)
-}
+	if idx, ok := txn.owner.pk.OffsetOf(key); ok {
+		return txn.QueryAt(idx, fn)
+	}
 
-// SelectAt performs a selection on a specific row specified by its index. It returns
-// a boolean value indicating whether an element is present at the index or not.
-func (txn *Txn) SelectAt(index uint32, fn func(v Selector)) bool {
-	return txn.owner.SelectAt(index, fn)
+	// If not found, insert at a new index
+	idx, err := txn.insert(fn, 0)
+	txn.bufferFor(txn.owner.pk.name).PutString(commit.Put, idx, key)
+	return err
 }
 
 // DeleteAt attempts to delete an item at the specified index for this transaction. If the item
 // exists, it marks at as deleted and returns true, otherwise it returns false.
 func (txn *Txn) DeleteAt(index uint32) bool {
+	txn.initialize()
 	if !txn.index.Contains(index) {
 		return false
 	}
@@ -279,89 +309,76 @@ func (txn *Txn) deleteAt(idx uint32) {
 	txn.bufferFor(rowColumn).PutOperation(commit.Delete, idx)
 }
 
-// Insert inserts an object at a new index and returns the index for this object. This is
-// done transactionally and the object will only be visible after the transaction is committed.
-func (txn *Txn) Insert(object Object) uint32 {
-	return txn.insert(object, 0)
+// InsertObject adds an object to a collection and returns the allocated index.
+func (txn *Txn) InsertObject(object Object) (uint32, error) {
+	return txn.insertObject(object, 0)
 }
 
-// InsertWithTTL inserts an object at a new index and returns the index for this object. In
-// addition, it also sets the time-to-live of an object to the specified time. This is done
-// transactionally and the object will only be visible after the transaction is committed.
-func (txn *Txn) InsertWithTTL(object Object, ttl time.Duration) uint32 {
-	return txn.insert(object, time.Now().Add(ttl).UnixNano())
+// InsertObjectWithTTL adds an object to a collection, sets the expiration time
+// based on the specified time-to-live and returns the allocated index.
+func (txn *Txn) InsertObjectWithTTL(object Object, ttl time.Duration) (uint32, error) {
+	return txn.insertObject(object, time.Now().Add(ttl).UnixNano())
 }
 
-// Insert inserts an object at a new index and returns the index for this object. This is
-// done transactionally and the object will only be visible after the transaction is committed.
-func (txn *Txn) insert(object Object, expireAt int64) uint32 {
-	slot := Cursor{
-		Selector: Selector{
-			idx: txn.owner.next(),
-			txn: txn,
-		},
-	}
+// Insert executes a mutable cursor transactionally at a new offset.
+func (txn *Txn) Insert(fn func(Row) error) (uint32, error) {
+	return txn.insert(fn, 0)
+}
 
-	// Set the insert bit and generate the updates
-	txn.bufferFor(rowColumn).PutOperation(commit.Insert, slot.idx)
-	for k, v := range object {
-		if _, ok := txn.columnAt(k); ok {
-			slot.SetAt(k, v)
+// InsertWithTTL executes a mutable cursor transactionally at a new offset and sets the expiration time
+// based on the specified time-to-live and returns the allocated index.
+func (txn *Txn) InsertWithTTL(ttl time.Duration, fn func(Row) error) (uint32, error) {
+	return txn.insert(fn, time.Now().Add(ttl).UnixNano())
+}
+
+// insertObject inserts all of the keys of a map, if previously registered as columns.
+func (txn *Txn) insertObject(object Object, expireAt int64) (uint32, error) {
+	return txn.insert(func(Row) error {
+		for k, v := range object {
+			if _, ok := txn.columnAt(k); ok {
+				txn.bufferFor(k).PutAny(commit.Put, txn.cursor, v)
+			}
 		}
-	}
-
-	// Add expiration if specified
-	if expireAt != 0 {
-		slot.SetAt(expireColumn, expireAt)
-	}
-	return slot.idx
+		return nil
+	}, expireAt)
 }
 
-// Select iterates over the result set and allows to read any column. While this
-// is flexible, it is not the most efficient way, consider Range() as an alternative
-// iteration method over a specific column which also supports modification.
-func (txn *Txn) Select(fn func(v Selector)) {
-	txn.rangeRead(func(offset uint32, index bitmap.Bitmap) {
-		index.Range(func(x uint32) {
-			fn(Selector{
-				idx: offset + x,
-				txn: txn,
-			})
-		})
-	})
-}
+// insert creates an insertion cursor for a given column and expiration time.
+func (txn *Txn) insert(fn func(Row) error, expireAt int64) (uint32, error) {
 
-// DeleteIf iterates over the result set and calls the provided funciton on each element. If
-// the function returns true, the element at the index will be marked for deletion. The
-// actual delete will take place once the transaction is committed.
-func (txn *Txn) DeleteIf(fn func(v Selector) bool) {
-	txn.index.Range(func(x uint32) {
-		if fn(Selector{idx: x, txn: txn}) {
-			txn.deleteAt(x)
-		}
+	// At a new index, add the insertion marker
+	idx := txn.owner.next()
+	txn.bufferFor(rowColumn).PutOperation(commit.Insert, idx)
+
+	// If no expiration was specified, simply insert
+	if expireAt == 0 {
+		return idx, txn.QueryAt(idx, fn)
+	}
+
+	// If expiration was specified, set it
+	return idx, txn.QueryAt(idx, func(r Row) error {
+		r.SetInt64(expireColumn, expireAt)
+		return fn(r)
 	})
 }
 
 // DeleteAll marks all of the items currently selected by this transaction for deletion. The
 // actual delete will take place once the transaction is committed.
 func (txn *Txn) DeleteAll() {
+	txn.initialize()
 	txn.index.Range(func(x uint32) {
 		txn.deleteAt(x)
 	})
 }
 
-// Range selects and iterates over a results for a specific column. The cursor provided
-// also allows to select other columns, but at a slight performance cost.
-func (txn *Txn) Range(column string, fn func(v Cursor)) error {
-	cur, err := txn.cursorFor(column)
-	if err != nil {
-		return err
-	}
-
+// Range selects and iterates over result set. In each iteration step, the internal
+// transaction cursor is updated and can be used by various column accessors.
+func (txn *Txn) Range(fn func(idx uint32)) error {
+	txn.initialize()
 	txn.rangeRead(func(offset uint32, index bitmap.Bitmap) {
 		index.Range(func(x uint32) {
-			cur.idx = offset + x
-			fn(cur)
+			txn.cursor = offset + x
+			fn(offset + x)
 		})
 	})
 	return nil
@@ -383,32 +400,41 @@ func (txn *Txn) commit() {
 
 	// Mark the dirty chunks from the updates
 	for _, u := range txn.updates {
-		u.RangeChunks(func(chunk uint32) {
-			txn.dirty.Set(chunk)
+		u.RangeChunks(func(chunk commit.Chunk) {
+			txn.dirty.Set(uint32(chunk))
 		})
 	}
 
-	// Get the upper bound chunk
-	lastChunk, _ := txn.dirty.Max()
-
 	// Grow the size of the fill list
 	markers, changedRows := txn.findMarkers()
-	max := txn.reader.MaxOffset(markers, lastChunk)
-	if max > 0 {
-		txn.commitCapacity(max)
+	if last, ok := txn.dirty.Max(); ok {
+		txn.commitCapacity(commit.Chunk(last))
 	}
 
 	// Commit chunk by chunk to reduce lock contentions
-	txn.rangeWrite(func(chunk uint32, fill bitmap.Bitmap) {
+	txn.rangeWrite(func(commitID uint64, chunk commit.Chunk, fill bitmap.Bitmap) {
 		if changedRows {
 			txn.commitMarkers(chunk, fill, markers)
 		}
 
-		updated := txn.commitUpdates(chunk, fill)
+		// Attemp to update, if nothing was changed we're done
+		updated := txn.commitUpdates(chunk)
+		if !changedRows && !updated {
+			return
+		}
 
-		// Write the commited chunk to the writer (if any)
-		if (changedRows || updated) && txn.writer != nil {
-			txn.writer.Write(commit.Commit{
+		// If there is a pending snapshot, append commit into a temp log
+		if dst, ok := txn.owner.isSnapshotting(); ok {
+			dst.Append(commit.Commit{
+				ID:      commitID,
+				Chunk:   chunk,
+				Updates: txn.updates,
+			})
+		}
+
+		if txn.logger != nil {
+			txn.logger.Append(commit.Commit{
+				ID:      commitID,
 				Chunk:   chunk,
 				Updates: txn.updates,
 			})
@@ -417,7 +443,7 @@ func (txn *Txn) commit() {
 }
 
 // commitUpdates applies the pending updates to the collection.
-func (txn *Txn) commitUpdates(chunk uint32, fill bitmap.Bitmap) (updated bool) {
+func (txn *Txn) commitUpdates(chunk commit.Chunk) (updated bool) {
 	for _, u := range txn.updates {
 		if u.IsEmpty() || u.Column == rowColumn {
 			continue // No updates for this column
@@ -444,7 +470,7 @@ func (txn *Txn) commitUpdates(chunk uint32, fill bitmap.Bitmap) (updated bool) {
 }
 
 // commitMarkers commits inserts and deletes to the collection.
-func (txn *Txn) commitMarkers(chunk uint32, fill bitmap.Bitmap, buffer *commit.Buffer) {
+func (txn *Txn) commitMarkers(chunk commit.Chunk, fill bitmap.Bitmap, buffer *commit.Buffer) {
 	txn.reader.Range(buffer, chunk, func(r *commit.Reader) {
 		for r.Next() {
 			txn.owner.lock.Lock()
@@ -482,11 +508,20 @@ func (txn *Txn) findMarkers() (*commit.Buffer, bool) {
 }
 
 // commitCapacity grows all columns until they reach the max index
-func (txn *Txn) commitCapacity(max uint32) {
+func (txn *Txn) commitCapacity(last commit.Chunk) {
 	txn.owner.lock.Lock()
 	defer txn.owner.lock.Unlock()
+	if len(txn.owner.commits) >= int(last+1) {
+		return
+	}
+
+	// Grow the commits array
+	for len(txn.owner.commits) < int(last+1) {
+		txn.owner.commits = append(txn.owner.commits, 0)
+	}
 
 	// Grow the fill list and all of the owner's columns
+	max := last.Max()
 	txn.owner.fill.Grow(max)
 	txn.owner.cols.Range(func(column *column) {
 		column.Grow(max)

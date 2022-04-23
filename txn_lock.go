@@ -5,6 +5,7 @@ package column
 
 import (
 	"github.com/kelindar/bitmap"
+	"github.com/kelindar/column/commit"
 )
 
 const (
@@ -14,17 +15,33 @@ const (
 	chunkSize   = 1 << chunkShift
 )
 
-// chunkOf returns a part of a bitmap for the corresponding chunk
-func chunkOf(v bitmap.Bitmap, chunk uint32) bitmap.Bitmap {
-	const shift = chunkShift - 6
-	x1 := min(int32(chunk+1)<<shift, int32(len(v)))
-	x0 := min(int32(chunk)<<shift, x1)
-	return v[x0:x1]
+// initialize ensures that the transaction is pre-initialized with the snapshot
+// of the owner's fill list.
+func (txn *Txn) initialize() {
+	if txn.setup {
+		return
+	}
+
+	txn.owner.lock.RLock()
+	txn.index.Grow(uint32(txn.owner.opts.Capacity))
+	txn.owner.fill.Clone(&txn.index)
+	txn.owner.lock.RUnlock()
+	txn.setup = true
 }
 
-// min returns a minimum of two numbers without branches.
-func min(v1, v2 int32) int32 {
-	return v2 + ((v1 - v2) & ((v1 - v2) >> 31))
+// --------------------------- Locked Seek ---------------------------
+
+// QueryAt jumps at a particular offset in the collection, sets the cursor to the
+// provided position and executes given callback fn.
+func (txn *Txn) QueryAt(index uint32, f func(Row) error) (err error) {
+	lock := txn.owner.slock
+	txn.cursor = index
+
+	chunk := commit.ChunkAt(index)
+	lock.RLock(uint(chunk))
+	err = f(Row{txn})
+	lock.RUnlock(uint(chunk))
+	return err
 }
 
 // --------------------------- Locked Range ---------------------------
@@ -32,43 +49,70 @@ func min(v1, v2 int32) int32 {
 // rangeRead iterates over index, chunk by chunk and ensures that each
 // chunk is protected by an appropriate read lock.
 func (txn *Txn) rangeRead(f func(offset uint32, index bitmap.Bitmap)) {
-	limit := uint32(len(txn.index) >> bitmapShift)
+	limit := commit.Chunk(len(txn.index) >> bitmapShift)
 	lock := txn.owner.slock
 
-	for chunk := uint32(0); chunk <= limit; chunk++ {
+	for chunk := commit.Chunk(0); chunk <= limit; chunk++ {
 		lock.RLock(uint(chunk))
-		f(chunk<<chunkShift, chunkOf(txn.index, chunk))
+		f(chunk.Min(), chunk.OfBitmap(txn.index))
 		lock.RUnlock(uint(chunk))
 	}
 }
 
 // rangeReadPair iterates over the index and another bitmap, chunk by chunk and
 // ensures that each chunk is protected by an appropriate read lock.
-func (txn *Txn) rangeReadPair(other bitmap.Bitmap, f func(a, b bitmap.Bitmap)) {
-	limit := uint32(len(txn.index) >> bitmapShift)
+func (txn *Txn) rangeReadPair(column *column, f func(a, b bitmap.Bitmap)) {
+	limit := commit.Chunk(len(txn.index) >> bitmapShift)
 	lock := txn.owner.slock
 
-	for chunk := uint32(0); chunk <= limit; chunk++ {
+	// To avoid a potential data race between the reading of the index bitmap
+	// and growing it (concurrent inserts), we need to acquire a read-lock.
+	txn.owner.lock.RLock()
+	other := *column.Index()
+	txn.owner.lock.RUnlock()
+
+	// Iterate through all of the chunks and acquire appropriate shard locks.
+	for chunk := commit.Chunk(0); chunk <= limit; chunk++ {
 		lock.RLock(uint(chunk))
-		f(chunkOf(txn.index, chunk), chunkOf(other, chunk))
+		f(chunk.OfBitmap(txn.index), chunk.OfBitmap(other))
 		lock.RUnlock(uint(chunk))
 	}
 }
 
 // rangeWrite ranges over the dirty chunks and acquires exclusive latches along
 // the way. This is used to commit a transaction.
-func (txn *Txn) rangeWrite(f func(chunk uint32, fill bitmap.Bitmap)) {
+func (txn *Txn) rangeWrite(fn func(commitID uint64, chunk commit.Chunk, fill bitmap.Bitmap)) {
 	lock := txn.owner.slock
-	txn.dirty.Range(func(chunk uint32) {
+	txn.dirty.Range(func(x uint32) {
+		chunk := commit.Chunk(x)
+		commitID := commit.Next()
 		lock.Lock(uint(chunk))
 
-		// Compute the fill
-		txn.owner.lock.Lock()
-		fill := chunkOf(txn.owner.fill, chunk)
-		txn.owner.lock.Unlock()
+		// Compute the fill and set the last commit ID
+		txn.owner.lock.RLock()
+		fill := chunk.OfBitmap(txn.owner.fill)
+		txn.owner.commits[chunk] = commitID // OK, since we have a shard lock
+		txn.owner.lock.RUnlock()
 
 		// Call the delegate
-		f(chunk, fill)
+		fn(commitID, chunk, fill)
 		lock.Unlock(uint(chunk))
 	})
+}
+
+// readChunk acquires appropriate locks for a chunk and executes a read callback
+func (c *Collection) readChunk(chunk commit.Chunk, fn func(uint64, commit.Chunk, bitmap.Bitmap) error) (err error) {
+	lock := c.slock
+	lock.RLock(uint(chunk))
+
+	// Compute the fill
+	c.lock.RLock()
+	fill := chunk.OfBitmap(c.fill)
+	commitID := c.commits[chunk]
+	c.lock.RUnlock()
+
+	// Call the delegate
+	err = fn(commitID, chunk, fill)
+	lock.RUnlock(uint(chunk))
+	return
 }

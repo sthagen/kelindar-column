@@ -43,6 +43,7 @@ type Column interface {
 	Value(idx uint32) (interface{}, bool)
 	Contains(idx uint32) bool
 	Index() *bitmap.Bitmap
+	Snapshot(chunk commit.Chunk, dst *commit.Buffer)
 }
 
 // Numeric represents a column that stores numbers.
@@ -80,37 +81,38 @@ var (
 	ForUint64  = makeUint64s
 	ForBool    = makeBools
 	ForEnum    = makeEnum
+	ForKey     = makeKey
 )
 
 // ForKind creates a new column instance for a specified reflect.Kind
-func ForKind(kind reflect.Kind) Column {
+func ForKind(kind reflect.Kind) (Column, error) {
 	switch kind {
 	case reflect.Float32:
-		return makeFloat32s()
+		return makeFloat32s(), nil
 	case reflect.Float64:
-		return makeFloat64s()
+		return makeFloat64s(), nil
 	case reflect.Int:
-		return makeInts()
+		return makeInts(), nil
 	case reflect.Int16:
-		return makeInt16s()
+		return makeInt16s(), nil
 	case reflect.Int32:
-		return makeInt32s()
+		return makeInt32s(), nil
 	case reflect.Int64:
-		return makeInt64s()
+		return makeInt64s(), nil
 	case reflect.Uint:
-		return makeUints()
+		return makeUints(), nil
 	case reflect.Uint16:
-		return makeUint16s()
+		return makeUint16s(), nil
 	case reflect.Uint32:
-		return makeUint32s()
+		return makeUint32s(), nil
 	case reflect.Uint64:
-		return makeUint64s()
+		return makeUint64s(), nil
 	case reflect.Bool:
-		return makeBools()
+		return makeBools(), nil
 	case reflect.String:
-		return makeStrings()
+		return makeStrings(), nil
 	default:
-		panic(fmt.Errorf("column: unsupported column kind (%v)", kind))
+		return nil, fmt.Errorf("column: unsupported column kind (%v)", kind)
 	}
 }
 
@@ -133,12 +135,18 @@ func columnFor(name string, v Column) *column {
 	}
 }
 
-// Is checks whether a column type supports certain numerical operations.
+// IsIndex returns whether the column is an index
+func (c *column) IsIndex() bool {
+	_, ok := c.Column.(*columnIndex)
+	return ok
+}
+
+// IsNumeric checks whether a column type supports certain numerical operations.
 func (c *column) IsNumeric() bool {
 	return (c.kind & typeNumeric) == typeNumeric
 }
 
-// Is checks whether a column type supports certain string operations.
+// IsTextual checks whether a column type supports certain string operations.
 func (c *column) IsTextual() bool {
 	return (c.kind & typeTextual) == typeTextual
 }
@@ -160,41 +168,20 @@ func (c *column) Apply(r *commit.Reader) {
 	c.Column.Apply(r)
 }
 
+// Snapshot takes a snapshot of a column, skipping indexes
+func (c *column) Snapshot(chunk commit.Chunk, buffer *commit.Buffer) bool {
+	if c.IsIndex() {
+		return false
+	}
+
+	buffer.Reset(c.name)
+	c.Column.Snapshot(chunk, buffer)
+	return true
+}
+
 // Value retrieves a value at a specified index
 func (c *column) Value(idx uint32) (v interface{}, ok bool) {
 	v, ok = c.Column.Value(idx)
-	return
-}
-
-// Value retrieves a value at a specified index
-func (c *column) String(idx uint32) (v string, ok bool) {
-	if column, text := c.Column.(Textual); text {
-		v, ok = column.LoadString(idx)
-	}
-	return
-}
-
-// Float64 retrieves a float64 value at a specified index
-func (c *column) Float64(idx uint32) (v float64, ok bool) {
-	if n, contains := c.Column.(Numeric); contains {
-		v, ok = n.LoadFloat64(idx)
-	}
-	return
-}
-
-// Int64 retrieves an int64 value at a specified index
-func (c *column) Int64(idx uint32) (v int64, ok bool) {
-	if n, contains := c.Column.(Numeric); contains {
-		v, ok = n.LoadInt64(idx)
-	}
-	return
-}
-
-// Uint64 retrieves an uint64 value at a specified index
-func (c *column) Uint64(idx uint32) (v uint64, ok bool) {
-	if n, contains := c.Column.(Numeric); contains {
-		v, ok = n.LoadUint64(idx)
-	}
 	return
 }
 
@@ -246,16 +233,120 @@ func (c *columnBool) Index() *bitmap.Bitmap {
 	return &c.data
 }
 
+// Snapshot writes the entire column into the specified destination buffer
+func (c *columnBool) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
+	dst.PutBitmap(commit.PutTrue, chunk, c.data)
+}
+
+// boolReader represents a read-only accessor for boolean values
+type boolReader struct {
+	cursor *uint32
+	reader Column
+}
+
+// Get loads the value at the current transaction cursor
+func (s boolReader) Get() bool {
+	return s.reader.Contains(*s.cursor)
+}
+
+// boolReaderFor creates a new reader
+func boolReaderFor(txn *Txn, columnName string) boolReader {
+	column, ok := txn.columnAt(columnName)
+	if !ok {
+		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
+	}
+
+	return boolReader{
+		cursor: &txn.cursor,
+		reader: column.Column,
+	}
+}
+
+// boolWriter represents read-write accessor for boolean values
+type boolWriter struct {
+	boolReader
+	writer *commit.Buffer
+}
+
+// Set sets the value at the current transaction cursor
+func (s boolWriter) Set(value bool) {
+	s.writer.PutBool(*s.cursor, value)
+}
+
+// Bool returns a bool column accessor
+func (txn *Txn) Bool(columnName string) boolWriter {
+	return boolWriter{
+		boolReader: boolReaderFor(txn, columnName),
+		writer:     txn.bufferFor(columnName),
+	}
+}
+
+// --------------------------- Accessor ----------------------------
+
+// anyReader represents a read-only accessor for any value
+type anyReader struct {
+	cursor *uint32
+	reader Column
+}
+
+// Get loads the value at the current transaction cursor
+func (s anyReader) Get() (interface{}, bool) {
+	return s.reader.Value(*s.cursor)
+}
+
+// anyReaderFor creates a new any reader
+func anyReaderFor(txn *Txn, columnName string) anyReader {
+	column, ok := txn.columnAt(columnName)
+	if !ok {
+		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
+	}
+
+	return anyReader{
+		cursor: &txn.cursor,
+		reader: column.Column,
+	}
+}
+
+// anyWriter represents read-write accessor for any column type
+type anyWriter struct {
+	anyReader
+	writer *commit.Buffer
+}
+
+// Set sets the value at the current transaction cursor
+func (s anyWriter) Set(value interface{}) {
+	s.writer.PutAny(commit.Put, *s.cursor, value)
+}
+
+// Any returns a column accessor
+func (txn *Txn) Any(columnName string) anyWriter {
+	return anyWriter{
+		anyReader: anyReaderFor(txn, columnName),
+		writer:    txn.bufferFor(columnName),
+	}
+}
+
 // --------------------------- funcs ----------------------------
 
-// capacityFor computes the next power of 2 for a given index
-func capacityFor(v uint32) int {
-	v--
-	v |= v >> 1
-	v |= v >> 2
-	v |= v >> 4
-	v |= v >> 8
-	v |= v >> 16
-	v++
-	return int(v)
+// resize calculates the new required capacity and a new index
+func resize(capacity int, v uint32) int {
+	const threshold = 256
+	if v < threshold {
+		v |= v >> 1
+		v |= v >> 2
+		v |= v >> 4
+		v |= v >> 8
+		v |= v >> 16
+		v++
+		return int(v)
+	}
+
+	if capacity < threshold {
+		capacity = threshold
+	}
+
+	for 0 < capacity && capacity < int(v+1) {
+		capacity += (capacity + 3*threshold) / 4
+	}
+	return capacity
 }

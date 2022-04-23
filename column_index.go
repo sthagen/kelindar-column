@@ -4,6 +4,9 @@
 package column
 
 import (
+	"fmt"
+	"sync"
+
 	"github.com/kelindar/bitmap"
 	"github.com/kelindar/column/commit"
 )
@@ -23,7 +26,6 @@ type Reader interface {
 // Assert reader implementations. Both our cursor and commit reader need to implement
 // this so that we can feed it to the index transparently.
 var _ Reader = new(commit.Reader)
-var _ Reader = new(Cursor)
 
 // --------------------------- Index ----------------------------
 
@@ -78,16 +80,6 @@ func (c *columnIndex) Apply(r *commit.Reader) {
 	}
 }
 
-// Update updates a single value in the index.
-func (c *columnIndex) Update(r Reader) {
-	if c.rule(r) {
-		c.fill.Set(r.Index())
-		return
-	}
-
-	c.fill.Remove(r.Index())
-}
-
 // Value retrieves a value at a specified index.
 func (c *columnIndex) Value(idx uint32) (v interface{}, ok bool) {
 	if idx < uint32(len(c.fill))<<6 {
@@ -104,4 +96,90 @@ func (c *columnIndex) Contains(idx uint32) bool {
 // Index returns the fill list for the column
 func (c *columnIndex) Index() *bitmap.Bitmap {
 	return &c.fill
+}
+
+// Snapshot writes the entire column into the specified destination buffer
+func (c *columnIndex) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
+	dst.PutBitmap(commit.PutTrue, chunk, c.fill)
+}
+
+// --------------------------- Key ----------------------------
+
+// columnKey represents the primary key column implementation
+type columnKey struct {
+	columnString
+	name string            // Name of the column
+	lock sync.RWMutex      // Lock to protect the lookup table
+	seek map[string]uint32 // Lookup table for O(1) index seek
+}
+
+// makeKey creates a new primary key column
+func makeKey() Column {
+	return &columnKey{
+		seek: make(map[string]uint32, 64),
+		columnString: columnString{
+			fill: make(bitmap.Bitmap, 0, 4),
+			data: make([]string, 0, 64),
+		},
+	}
+}
+
+// Apply applies a set of operations to the column.
+func (c *columnKey) Apply(r *commit.Reader) {
+	for r.Next() {
+		switch r.Type {
+		case commit.Put:
+			value := string(r.Bytes())
+
+			c.fill[r.Offset>>6] |= 1 << (r.Offset & 0x3f)
+			c.data[r.Offset] = value
+			c.lock.Lock()
+			c.seek[value] = uint32(r.Offset)
+			c.lock.Unlock()
+
+		case commit.Delete:
+			c.fill.Remove(r.Index())
+			c.lock.Lock()
+			delete(c.seek, string(c.data[r.Offset]))
+			c.lock.Unlock()
+		}
+	}
+}
+
+// OffsetOf returns the offset for a particular value
+func (c *columnKey) OffsetOf(v string) (uint32, bool) {
+	c.lock.RLock()
+	idx, ok := c.seek[v]
+	c.lock.RUnlock()
+	return idx, ok
+}
+
+// slice accessor for keys
+type keySlice struct {
+	cursor *uint32
+	writer *commit.Buffer
+	reader *columnKey
+}
+
+// Set sets the value at the current transaction index
+func (s keySlice) Set(value string) {
+	s.writer.PutString(commit.Put, *s.cursor, value)
+}
+
+// Get loads the value at the current transaction index
+func (s keySlice) Get() (string, bool) {
+	return s.reader.LoadString(*s.cursor)
+}
+
+// Enum returns a enumerable column accessor
+func (txn *Txn) Key() keySlice {
+	if txn.owner.pk == nil {
+		panic(fmt.Errorf("column: primary key column does not exist"))
+	}
+
+	return keySlice{
+		cursor: &txn.cursor,
+		writer: txn.bufferFor(txn.owner.pk.name),
+		reader: txn.owner.pk,
+	}
 }

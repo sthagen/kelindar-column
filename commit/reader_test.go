@@ -15,7 +15,7 @@ func TestQueue(t *testing.T) {
 	buf := NewBuffer(0)
 	buf.Reset("test")
 	for i := uint32(0); i < 10; i++ {
-		buf.PutUint64(Put, i, 2*uint64(i))
+		buf.PutUint64(i, 2*uint64(i))
 	}
 
 	i := 0
@@ -38,7 +38,7 @@ func TestRandom(t *testing.T) {
 
 	buf := NewBuffer(0)
 	for i := uint32(0); i < 1000; i++ {
-		buf.PutUint32(Put, seq[i], uint32(rand.Int31()))
+		buf.PutUint32(seq[i], uint32(rand.Int31()))
 	}
 
 	i := 0
@@ -60,12 +60,12 @@ func TestRange(t *testing.T) {
 
 	buf := NewBuffer(0)
 	for i := uint32(0); i < count; i++ {
-		buf.PutUint32(Put, seq[i], uint32(rand.Int31()))
+		buf.PutUint32(seq[i], uint32(rand.Int31()))
 	}
 
 	r := NewReader()
 	for i := 0; i < 100; i++ {
-		r.Range(buf, uint32(i), func(r *Reader) {
+		r.Range(buf, Chunk(i), func(r *Reader) {
 			for r.Next() {
 				assert.Equal(t, Put, r.Type)
 				assert.Equal(t, i, int(r.Offset>>chunkShift))
@@ -96,8 +96,8 @@ func TestReadSwap(t *testing.T) {
 	// Should only have 1 chunk
 	assert.False(t, buf.IsEmpty())
 	assert.Equal(t, 1, len(buf.chunks))
-	buf.RangeChunks(func(chunk uint32) {
-		assert.Equal(t, uint32(0), chunk)
+	buf.RangeChunks(func(chunk Chunk) {
+		assert.Equal(t, Chunk(0), chunk)
 	})
 
 	r := NewReader()
@@ -186,7 +186,7 @@ func TestWriteUnsupported(t *testing.T) {
 
 func TestReaderIface(t *testing.T) {
 	buf := NewBuffer(0)
-	buf.PutFloat64(Put, 777, float64(1))
+	buf.PutFloat64(777, float64(1))
 
 	r := NewReader()
 	r.Seek(buf)
@@ -195,30 +195,43 @@ func TestReaderIface(t *testing.T) {
 	assert.Equal(t, uint32(777), r.Index())
 }
 
-func TestReaderMax(t *testing.T) {
+func TestReadIntMixedSize(t *testing.T) {
 	buf := NewBuffer(0)
-	buf.Reset("test")
-	for i := uint32(0); i < 20000; i++ {
-		buf.PutUint64(Put, i, 2*uint64(i))
-	}
+	buf.PutInt16(0, 10)
+	buf.PutInt32(1, 20)
+	buf.PutInt64(2, 30)
+	buf.PutString(Put, 3, "hello")
 
 	r := NewReader()
-	assert.Equal(t, 16383, int(r.MaxOffset(buf, 0)))
-	assert.Equal(t, 19999, int(r.MaxOffset(buf, 1)))
-	assert.Equal(t, 0, int(r.MaxOffset(nil, 0)))
+	r.Seek(buf)
+	assert.True(t, r.Next())
+	assert.Equal(t, 10, r.Int())
+	assert.True(t, r.Next())
+	assert.Equal(t, 20, r.Int())
+	assert.True(t, r.Next())
+	assert.Equal(t, 30, r.Int())
+	assert.True(t, r.Next())
+	assert.Panics(t, func() {
+		r.Int()
+	})
 }
 
-func TestRewindAfterMax(t *testing.T) {
+func TestReadFloatMixedSize(t *testing.T) {
 	buf := NewBuffer(0)
-	buf.Reset("test")
-	for i := uint32(0); i < 10; i++ {
-		buf.PutUint64(Put, i, 2*uint64(i))
-	}
+	buf.PutFloat32(0, 10)
+	buf.PutFloat64(1, 20)
+	buf.PutString(Put, 3, "hello")
 
 	r := NewReader()
-	assert.Equal(t, 9, int(r.MaxOffset(buf, 0)))
+	r.Seek(buf)
 	assert.True(t, r.Next())
-	assert.Equal(t, 0, int(r.Index()))
+	assert.Equal(t, 10.0, r.Float())
+	assert.True(t, r.Next())
+	assert.Equal(t, 20.0, r.Float())
+	assert.True(t, r.Next())
+	assert.Panics(t, func() {
+		r.Float()
+	})
 }
 
 func TestReadSize(t *testing.T) {

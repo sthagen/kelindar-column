@@ -13,9 +13,9 @@ import (
 type Reader struct {
 	head   int    // The read position
 	i0, i1 int    // The value start and end
+	Type   OpType // The current operation type
 	buffer []byte // The log slice
 	Offset int32  // The current offset
-	Type   OpType // The current operation type
 	start  int32  // The start offset
 }
 
@@ -104,19 +104,35 @@ func (r *Reader) Index() uint32 {
 	return uint32(r.Offset)
 }
 
-// Int reads a int64 value.
+// Int reads a int value of any size.
 func (r *Reader) Int() int {
-	return int(binary.BigEndian.Uint64(r.buffer[r.i0:r.i1]))
+	return int(r.Uint())
 }
 
-// Uint reads a uint64 value.
+// Uint reads a uint value of any size.
 func (r *Reader) Uint() uint {
-	return uint(binary.BigEndian.Uint64(r.buffer[r.i0:r.i1]))
+	switch r.i1 - r.i0 {
+	case 2:
+		return uint(binary.BigEndian.Uint16(r.buffer[r.i0:r.i1]))
+	case 4:
+		return uint(binary.BigEndian.Uint32(r.buffer[r.i0:r.i1]))
+	case 8:
+		return uint(binary.BigEndian.Uint64(r.buffer[r.i0:r.i1]))
+	default:
+		panic("column: unable to read, unsupported integer size")
+	}
 }
 
-// Float reads a float64 value.
+// Float reads a floating-point value of any size.
 func (r *Reader) Float() float64 {
-	return r.Float64()
+	switch r.i1 - r.i0 {
+	case 4:
+		return float64(r.Float32())
+	case 8:
+		return r.Float64()
+	default:
+		panic("column: unable to read, unsupported float size")
+	}
 }
 
 // String reads a string value.
@@ -198,7 +214,7 @@ func (r *Reader) SwapBool(b bool) {
 // --------------------------- Chunk Iterator ----------------------------
 
 // Range iterates over parts of the buffer which match the specified chunk.
-func (r *Reader) Range(buf *Buffer, chunk uint32, fn func(*Reader)) {
+func (r *Reader) Range(buf *Buffer, chunk Chunk, fn func(*Reader)) {
 	for i, c := range buf.chunks {
 		if c.Chunk != chunk {
 			continue // Not the right chunk, skip it
@@ -218,25 +234,6 @@ func (r *Reader) Range(buf *Buffer, chunk uint32, fn func(*Reader)) {
 		r.start = int32(c.Value)
 		fn(r)
 	}
-}
-
-// MaxOffset returns the maximum offset for a chunk
-func (r *Reader) MaxOffset(buf *Buffer, chunk uint32) (max uint32) {
-	if buf == nil {
-		return
-	}
-
-	r.Range(buf, chunk, func(r *Reader) {
-		for r.Next() {
-			if max < r.Index() {
-				max = r.Index()
-			}
-		}
-	})
-
-	// Rewind after this, so we can re-use the reader after
-	r.Rewind()
-	return
 }
 
 // --------------------------- Next Iterator ----------------------------
@@ -329,20 +326,19 @@ func (r *Reader) readOffset() {
 // readFixed reads the fixed-size value at the current position.
 func (r *Reader) readFixed(v byte) {
 	size := int(1 << (v >> 4 & 0b11) & 0b1110)
-	r.Type = OpType(v & 0xf)
 	r.head++
 	r.i0 = r.head
 	r.head += size
 	r.i1 = r.head
+	r.Type = OpType(v & 0xf)
 }
 
 // readString reads the operation type and the value at the current position.
 func (r *Reader) readString(v byte) {
-	_ = r.buffer[r.head+2]
 	size := int(r.buffer[r.head+2]) | int(r.buffer[r.head+1])<<8
-	r.Type = OpType(v & 0xf)
 	r.head += 3
 	r.i0 = r.head
 	r.head += size
 	r.i1 = r.head
+	r.Type = OpType(v & 0xf)
 }

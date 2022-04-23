@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -22,6 +23,12 @@ func main() {
 	measure("insert", fmt.Sprintf("%v rows", amount), func() {
 		createCollection(players, amount)
 	}, 1)
+
+	// snapshot the dataset
+	measure("snapshot", fmt.Sprintf("%v rows", amount), func() {
+		buffer := bytes.NewBuffer(nil)
+		players.Snapshot(buffer)
+	}, 10)
 
 	// run a full scan
 	measure("full scan", "age >= 30", func() {
@@ -65,9 +72,10 @@ func main() {
 	measure("update", "balance of everyone", func() {
 		updates := 0
 		players.Query(func(txn *column.Txn) error {
-			return txn.Range("balance", func(v column.Cursor) {
+			balance := txn.Float64("balance")
+			return txn.Range(func(idx uint32) {
 				updates++
-				v.SetFloat64(1000.0)
+				balance.Set(1000.0)
 			})
 		})
 		fmt.Printf("-> updated %v rows\n", updates)
@@ -77,9 +85,10 @@ func main() {
 	measure("update", "age of mages", func() {
 		updates := 0
 		players.Query(func(txn *column.Txn) error {
-			return txn.With("mage").Range("age", func(v column.Cursor) {
+			age := txn.Float64("age")
+			return txn.With("mage").Range(func(idx uint32) {
 				updates++
-				v.SetFloat64(99.0)
+				age.Set(99.0)
 			})
 		})
 		fmt.Printf("-> updated %v rows\n", updates)
@@ -140,7 +149,7 @@ func createCollection(out *column.Collection, amount int) *column.Collection {
 
 		out.Query(func(txn *column.Txn) error {
 			for _, p := range data {
-				txn.Insert(p)
+				txn.InsertObject(p)
 			}
 			return nil
 		})

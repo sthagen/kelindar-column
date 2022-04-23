@@ -27,21 +27,24 @@ const (
 
 // Collection represents a collection of objects in a columnar format
 type Collection struct {
-	count  uint64             // The current count of elements
-	txns   *txnPool           // The transaction pool
-	lock   sync.RWMutex       // The mutex to guard the fill-list
-	slock  *smutex.SMutex128  // The sharded mutex for the collection
-	cols   columns            // The map of columns
-	fill   bitmap.Bitmap      // The fill-list
-	size   int                // The initial size for new columns
-	writer commit.Writer      // The commit writer
-	cancel context.CancelFunc // The cancellation function for the context
+	count   uint64             // The current count of elements
+	txns    *txnPool           // The transaction pool
+	lock    sync.RWMutex       // The mutex to guard the fill-list
+	slock   *smutex.SMutex128  // The sharded mutex for the collection
+	cols    columns            // The map of columns
+	fill    bitmap.Bitmap      // The fill-list
+	opts    Options            // The options configured
+	logger  commit.Logger      // The commit logger for CDC
+	record  *commit.Log        // The commit logger for snapshot
+	pk      *columnKey         // The primary key column
+	cancel  context.CancelFunc // The cancellation function for the context
+	commits []uint64           // The array of commit IDs for corresponding chunk
 }
 
 // Options represents the options for a collection.
 type Options struct {
 	Capacity int           // The initial capacity when creating columns
-	Writer   commit.Writer // The writer for the commit log (optional)
+	Writer   commit.Logger // The writer for the commit log (optional)
 	Vacuum   time.Duration // The interval at which the vacuum of expired entries will be done
 }
 
@@ -71,10 +74,10 @@ func NewCollection(opts ...Options) *Collection {
 	store := &Collection{
 		cols:   makeColumns(8),
 		txns:   newTxnPool(),
-		size:   options.Capacity,
+		opts:   options,
 		slock:  new(smutex.SMutex128),
 		fill:   make(bitmap.Bitmap, 0, options.Capacity>>6),
-		writer: options.Writer,
+		logger: options.Writer,
 		cancel: cancel,
 	}
 
@@ -88,6 +91,7 @@ func NewCollection(opts ...Options) *Collection {
 func (c *Collection) next() uint32 {
 	c.lock.Lock()
 	idx := c.findFreeIndex(atomic.AddUint64(&c.count, 1))
+
 	c.fill.Set(idx)
 	c.lock.Unlock()
 	return idx
@@ -104,9 +108,9 @@ func (c *Collection) findFreeIndex(count uint64) uint32 {
 
 	// Check if we have space at the end, since if we're inserting a lot of data it's more
 	// likely that we're full in the beginning.
-	if fillSize > 0 {
-		if tail := c.fill[fillSize-1]; tail != 0xffffffffffffffff {
-			return uint32((fillSize-1)<<6 + bits.TrailingZeros64(^tail))
+	if tailAt := int((count - 1) >> 6); fillSize > tailAt {
+		if tail := c.fill[tailAt]; tail != 0xffffffffffffffff {
+			return uint32((tailAt)<<6 + bits.TrailingZeros64(^tail))
 		}
 	}
 
@@ -115,45 +119,42 @@ func (c *Collection) findFreeIndex(count uint64) uint32 {
 	return idx
 }
 
-// Insert adds an object to a collection and returns the allocated index.
-func (c *Collection) Insert(obj Object) (index uint32) {
+// InsertObject adds an object to a collection and returns the allocated index.
+func (c *Collection) InsertObject(obj Object) (index uint32) {
 	c.Query(func(txn *Txn) error {
-		index = txn.Insert(obj)
+		index, _ = txn.InsertObject(obj)
 		return nil
 	})
 	return
 }
 
-// InsertWithTTL adds an object to a collection, sets the expiration time
+// InsertObjectWithTTL adds an object to a collection, sets the expiration time
 // based on the specified time-to-live and returns the allocated index.
-func (c *Collection) InsertWithTTL(obj Object, ttl time.Duration) (index uint32) {
+func (c *Collection) InsertObjectWithTTL(obj Object, ttl time.Duration) (index uint32) {
 	c.Query(func(txn *Txn) error {
-		index = txn.InsertWithTTL(obj, ttl)
+		index, _ = txn.InsertObjectWithTTL(obj, ttl)
 		return nil
 	})
 	return
 }
 
-// UpdateAt updates a specific row by initiating a separate transaction for the update.
-func (c *Collection) UpdateAt(idx uint32, columnName string, fn func(v Cursor) error) error {
-	return c.Query(func(txn *Txn) error {
-		return txn.UpdateAt(idx, columnName, fn)
+// Insert executes a mutable cursor transactionally at a new offset.
+func (c *Collection) Insert(fn func(Row) error) (index uint32, err error) {
+	err = c.Query(func(txn *Txn) (innerErr error) {
+		index, innerErr = txn.Insert(fn)
+		return
 	})
+	return
 }
 
-// SelectAt performs a selection on a specific row specified by its index. It returns
-// a boolean value indicating whether an element is present at the index or not.
-func (c *Collection) SelectAt(idx uint32, fn func(v Selector)) bool {
-	chunk := uint(idx >> chunkShift)
-	if idx >= uint32(len(c.fill))<<6 || !c.fill.Contains(idx) {
-		return false
-	}
-
-	// Lock the chunk which we are about to read and call the selector delegate
-	c.slock.RLock(chunk)
-	fn(Selector{idx: idx, col: c})
-	c.slock.RUnlock(chunk)
-	return true
+// InsertWithTTL executes a mutable cursor transactionally at a new offset and sets the expiration time
+// based on the specified time-to-live and returns the allocated index.
+func (c *Collection) InsertWithTTL(ttl time.Duration, fn func(Row) error) (index uint32, err error) {
+	err = c.Query(func(txn *Txn) (innerErr error) {
+		index, innerErr = txn.InsertWithTTL(ttl, fn)
+		return
+	})
+	return
 }
 
 // DeleteAt attempts to delete an item at the specified index for this collection. If the item
@@ -171,17 +172,46 @@ func (c *Collection) Count() (count int) {
 	return int(atomic.LoadUint64(&c.count))
 }
 
-// CreateColumnsOf registers a set of columns that are present in the target object.
-func (c *Collection) CreateColumnsOf(object Object) {
-	for k, v := range object {
-		c.CreateColumn(k, ForKind(reflect.TypeOf(v).Kind()))
+// createColumnKey attempts to create a primary key column
+func (c *Collection) createColumnKey(columnName string, column *columnKey) error {
+	if c.pk != nil {
+		return fmt.Errorf("column: unable to create key column '%s', another one exists", columnName)
 	}
+
+	c.pk = column
+	c.pk.name = columnName
+	return nil
+}
+
+// CreateColumnsOf registers a set of columns that are present in the target object.
+func (c *Collection) CreateColumnsOf(object Object) error {
+	for k, v := range object {
+		column, err := ForKind(reflect.TypeOf(v).Kind())
+		if err != nil {
+			return err
+		}
+
+		if err := c.CreateColumn(k, column); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CreateColumn creates a column of a specified type and adds it to the collection.
-func (c *Collection) CreateColumn(columnName string, column Column) {
-	column.Grow(uint32(c.size))
+func (c *Collection) CreateColumn(columnName string, column Column) error {
+	if _, ok := c.cols.Load(columnName); ok {
+		return fmt.Errorf("column: unable to create column '%s', already exists", columnName)
+	}
+
+	column.Grow(uint32(c.opts.Capacity))
 	c.cols.Store(columnName, columnFor(columnName, column))
+
+	// If necessary, create a primary key column
+	if pk, ok := column.(*columnKey); ok {
+		return c.createColumnKey(columnName, pk)
+	}
+	return nil
 }
 
 // DropColumn removes the column (or an index) with the specified name. If the column with this
@@ -207,19 +237,24 @@ func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader)
 	// Create and add the index column,
 	index := newIndex(indexName, columnName, fn)
 	c.lock.Lock()
-	index.Grow(uint32(c.size))
+	index.Grow(uint32(c.opts.Capacity))
 	c.cols.Store(indexName, index)
 	c.cols.Store(columnName, column, index)
 	c.lock.Unlock()
 
-	// If a column with this name already exists, iterate through all of the values
-	// that we have in the collection and apply the filter.
-	return c.Query(func(txn *Txn) error {
-		impl := index.Column.(*columnIndex)
-		return txn.With(columnName).Range(columnName, func(v Cursor) {
-			impl.Update(&v)
-		})
-	})
+	// Iterate over all of the values of the target column, chunk by chunk and fill
+	// the index accordingly.
+	chunks := c.chunks()
+	buffer := commit.NewBuffer(c.Count())
+	reader := commit.NewReader()
+	for chunk := commit.Chunk(0); int(chunk) < chunks; chunk++ {
+		if column.Snapshot(chunk, buffer) {
+			reader.Seek(buffer)
+			index.Apply(reader)
+		}
+	}
+
+	return nil
 }
 
 // DropIndex removes the index column with the specified name. If the index with this
@@ -241,14 +276,28 @@ func (c *Collection) DropIndex(indexName string) error {
 	return nil
 }
 
+// QueryAt jumps at a particular offset in the collection, sets the cursor to the
+// provided position and executes given callback fn.
+func (c *Collection) QueryAt(idx uint32, fn func(Row) error) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.QueryAt(idx, fn)
+	})
+}
+
+// QueryAt jumps at a particular key in the collection, sets the cursor to the
+// provided position and executes given callback fn.
+func (c *Collection) QueryKey(key string, fn func(Row) error) error {
+	return c.Query(func(txn *Txn) error {
+		return txn.QueryKey(key, fn)
+	})
+}
+
 // Query creates a transaction which allows for filtering and iteration over the
 // columns in this collection. It also allows for individual rows to be modified or
 // deleted during iteration (range), but the actual operations will be queued and
 // executed after the iteration.
 func (c *Collection) Query(fn func(txn *Txn) error) error {
-	c.lock.RLock()
 	txn := c.txns.acquire(c)
-	c.lock.RUnlock()
 
 	// Execute the query and keep the error for later
 	if err := fn(txn); err != nil {
@@ -279,29 +328,17 @@ func (c *Collection) vacuum(ctx context.Context, interval time.Duration) {
 			ticker.Stop()
 			return
 		case <-ticker.C:
-			now := int(time.Now().UnixNano())
+			now := time.Now().UnixNano()
 			c.Query(func(txn *Txn) error {
-				return txn.With(expireColumn).Range(expireColumn, func(v Cursor) {
-					if expirateAt := v.Int(); expirateAt != 0 && now >= v.Int() {
-						v.Delete()
+				expire := txn.Int64(expireColumn)
+				return txn.With(expireColumn).Range(func(idx uint32) {
+					if expirateAt, ok := expire.Get(); ok && expirateAt != 0 && now >= expirateAt {
+						txn.DeleteAt(idx)
 					}
 				})
 			})
 		}
 	}
-}
-
-// Replay replays a commit on a collection, applying the changes.
-func (c *Collection) Replay(change commit.Commit) error {
-	return c.Query(func(txn *Txn) error {
-		txn.dirty.Set(change.Chunk)
-		for i := range change.Updates {
-			if !change.Updates[i].IsEmpty() {
-				txn.updates = append(txn.updates, change.Updates[i])
-			}
-		}
-		return nil
-	})
 }
 
 // --------------------------- column registry ---------------------------
@@ -326,12 +363,35 @@ type columnEntry struct {
 	cols []*column // The columns and its computed
 }
 
-// Range iterates over columns in the registry.
+// Count returns the number of columns, excluding indexes.
+func (c *columns) Count() (count int) {
+	cols := c.cols.Load().([]columnEntry)
+	for _, v := range cols {
+		if !v.cols[0].IsIndex() {
+			count++
+		}
+	}
+	return
+}
+
+// Range iterates over columns in the registry. This is faster than RangeUntil
+// method.
 func (c *columns) Range(fn func(column *column)) {
 	cols := c.cols.Load().([]columnEntry)
 	for _, v := range cols {
 		fn(v.cols[0])
 	}
+}
+
+// RangeUntil iterates over columns in the registry until an error occurs.
+func (c *columns) RangeUntil(fn func(column *column) error) error {
+	cols := c.cols.Load().([]columnEntry)
+	for _, v := range cols {
+		if err := fn(v.cols[0]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Load loads a column by its name.

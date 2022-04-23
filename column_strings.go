@@ -4,37 +4,34 @@
 package column
 
 import (
-	"encoding/binary"
-	"hash/crc32"
+	"fmt"
 	"math"
-	"reflect"
-	"sync"
-	"unsafe"
 
 	"github.com/kelindar/bitmap"
 	"github.com/kelindar/column/commit"
+	"github.com/kelindar/intmap"
+	"github.com/zeebo/xxh3"
 )
 
 // --------------------------- Enum ----------------------------
 
 var _ Textual = new(columnEnum)
 
-// columnEnum represents a enumerable string column
+// columnEnum represents a string column
 type columnEnum struct {
-	lock  sync.RWMutex
-	fill  bitmap.Bitmap     // The fill-list
-	locs  []uint32          // The list of locations
-	data  []byte            // The actual values
-	cache map[string]uint32 // Cache for string locations (no need to persist)
+	fill bitmap.Bitmap // The fill-list
+	locs []uint32      // The list of locations
+	seek *intmap.Sync  // The hash->location table
+	data []string      // The string data
 }
 
 // makeEnum creates a new column
 func makeEnum() Column {
 	return &columnEnum{
-		fill:  make(bitmap.Bitmap, 0, 4),
-		locs:  make([]uint32, 0, 64),
-		data:  make([]byte, 0, 16*32),
-		cache: make(map[string]uint32, 16),
+		fill: make(bitmap.Bitmap, 0, 4),
+		locs: make([]uint32, 0, 64),
+		seek: intmap.NewSync(64, .95),
+		data: make([]string, 0, 64),
 	}
 }
 
@@ -51,7 +48,7 @@ func (c *columnEnum) Grow(idx uint32) {
 	}
 
 	c.fill.Grow(idx)
-	clone := make([]uint32, idx+1, capacityFor(idx+1))
+	clone := make([]uint32, idx+1, resize(cap(c.locs), idx+1))
 	copy(clone, c.locs)
 	c.locs = clone
 }
@@ -61,24 +58,9 @@ func (c *columnEnum) Apply(r *commit.Reader) {
 	for r.Next() {
 		switch r.Type {
 		case commit.Put:
-			// Attempt to find if we already have the location of this value from the
-			// cache, and if we don't, find it and set the offset for faster lookup.
-			value := r.String()
-
-			c.lock.RLock()
-			offset, cached := c.cache[value]
-			c.lock.RUnlock()
-
-			if !cached {
-				c.lock.Lock()
-				offset = c.findOrAdd(value)
-				c.cache[value] = offset
-				c.lock.Unlock()
-			}
-
 			// Set the value at the index
 			c.fill[r.Offset>>6] |= 1 << (r.Offset & 0x3f)
-			c.locs[r.Offset] = offset
+			c.locs[r.Offset] = c.findOrAdd(r.Bytes())
 
 		case commit.Delete:
 			c.fill.Remove(r.Index())
@@ -89,34 +71,18 @@ func (c *columnEnum) Apply(r *commit.Reader) {
 }
 
 // Search for the string or adds it and returns the offset
-func (c *columnEnum) findOrAdd(v string) uint32 {
-	value := toBytes(v)
-	target := crc32.ChecksumIEEE(value)
-	for i := 0; i < len(c.data); {
-		hash := binary.BigEndian.Uint32(c.data[i : i+4])
-		size := int(c.data[i+4])
-		if hash == target {
-			return uint32(i + 4)
-		}
-
-		i += 5 + size
-	}
-
-	// Not found, add
-	var head [5]byte
-	binary.BigEndian.PutUint32(head[0:4], target)
-	head[4] = byte(len(value)) // Max 255 chars
-	addedAt := len(c.data)
-	c.data = append(c.data, head[:]...)
-	c.data = append(c.data, value...)
-	return uint32(addedAt + 4)
+func (c *columnEnum) findOrAdd(v []byte) uint32 {
+	target := uint32(xxh3.Hash(v))
+	at, _ := c.seek.LoadOrStore(target, func() uint32 {
+		c.data = append(c.data, string(v))
+		return uint32(len(c.data)) - 1
+	})
+	return at
 }
 
 // readAt reads a string at a location
 func (c *columnEnum) readAt(at uint32) string {
-	size := uint32(c.data[at])
-	data := c.data[at+1 : at+1+size]
-	return toString(&data)
+	return c.data[at]
 }
 
 // Value retrieves a value at a specified index
@@ -138,8 +104,10 @@ func (c *columnEnum) FilterString(offset uint32, index bitmap.Bitmap, predicate 
 	cache := struct {
 		index uint32 // Last seen offset
 		value bool   // Last evaluated predicate
-	}{}
-	cache.index = math.MaxUint32
+	}{
+		index: math.MaxUint32,
+		value: false,
+	}
 
 	// Do a quick ellimination of elements which are NOT contained in this column, this
 	// allows us not to check contains during the filter itself
@@ -168,6 +136,61 @@ func (c *columnEnum) Contains(idx uint32) bool {
 // Index returns the fill list for the column
 func (c *columnEnum) Index() *bitmap.Bitmap {
 	return &c.fill
+}
+
+// Snapshot writes the entire column into the specified destination buffer
+func (c *columnEnum) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
+	chunk.Range(c.fill, func(idx uint32) {
+		dst.PutString(commit.Put, idx, c.readAt(c.locs[idx]))
+	})
+}
+
+// enumReader represents a read-only accessor for enum strings
+type enumReader struct {
+	cursor *uint32
+	reader *columnEnum
+}
+
+// Get loads the value at the current transaction cursor
+func (s enumReader) Get() (string, bool) {
+	return s.reader.LoadString(*s.cursor)
+}
+
+// enumReaderFor creates a new enum string reader
+func enumReaderFor(txn *Txn, columnName string) enumReader {
+	column, ok := txn.columnAt(columnName)
+	if !ok {
+		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
+	}
+
+	reader, ok := column.Column.(*columnEnum)
+	if !ok {
+		panic(fmt.Errorf("column: column '%s' is not of type string", columnName))
+	}
+
+	return enumReader{
+		cursor: &txn.cursor,
+		reader: reader,
+	}
+}
+
+// slice accessor for enums
+type enumSlice struct {
+	enumReader
+	writer *commit.Buffer
+}
+
+// Set sets the value at the current transaction cursor
+func (s enumSlice) Set(value string) {
+	s.writer.PutString(commit.Put, *s.cursor, value)
+}
+
+// Enum returns a enumerable column accessor
+func (txn *Txn) Enum(columnName string) enumSlice {
+	return enumSlice{
+		enumReader: enumReaderFor(txn, columnName),
+		writer:     txn.bufferFor(columnName),
+	}
 }
 
 // --------------------------- String ----------------------------
@@ -201,7 +224,7 @@ func (c *columnString) Grow(idx uint32) {
 	}
 
 	c.fill.Grow(idx)
-	clone := make([]string, idx+1, capacityFor(idx+1))
+	clone := make([]string, idx+1, resize(cap(c.data), idx+1))
 	copy(clone, c.data)
 	c.data = clone
 }
@@ -256,21 +279,57 @@ func (c *columnString) FilterString(offset uint32, index bitmap.Bitmap, predicat
 	})
 }
 
-// --------------------------- Convert ----------------------------
-
-// toBytes converts a string to a byte slice without allocating.
-func toBytes(v string) (b []byte) {
-	strHeader := (*reflect.StringHeader)(unsafe.Pointer(&v))
-	byteHeader := (*reflect.SliceHeader)(unsafe.Pointer(&b))
-	byteHeader.Data = strHeader.Data
-
-	l := len(v)
-	byteHeader.Len = l
-	byteHeader.Cap = l
-	return
+// Snapshot writes the entire column into the specified destination buffer
+func (c *columnString) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
+	chunk.Range(c.fill, func(idx uint32) {
+		dst.PutString(commit.Put, idx, c.data[idx])
+	})
 }
 
-// toString converts a strign to a byte slice without allocating.
-func toString(b *[]byte) string {
-	return *(*string)(unsafe.Pointer(b))
+// stringReader represents a read-only accessor for strings
+type stringReader struct {
+	cursor *uint32
+	reader *columnString
+}
+
+// Get loads the value at the current transaction cursor
+func (s stringReader) Get() (string, bool) {
+	return s.reader.LoadString(*s.cursor)
+}
+
+// stringReaderFor creates a new string reader
+func stringReaderFor(txn *Txn, columnName string) stringReader {
+	column, ok := txn.columnAt(columnName)
+	if !ok {
+		panic(fmt.Errorf("column: column '%s' does not exist", columnName))
+	}
+
+	reader, ok := column.Column.(*columnString)
+	if !ok {
+		panic(fmt.Errorf("column: column '%s' is not of type string", columnName))
+	}
+
+	return stringReader{
+		cursor: &txn.cursor,
+		reader: reader,
+	}
+}
+
+// stringWriter represents read-write accessor for strings
+type stringWriter struct {
+	stringReader
+	writer *commit.Buffer
+}
+
+// Set sets the value at the current transaction cursor
+func (s stringWriter) Set(value string) {
+	s.writer.PutString(commit.Put, *s.cursor, value)
+}
+
+// String returns a string column accessor
+func (txn *Txn) String(columnName string) stringWriter {
+	return stringWriter{
+		stringReader: stringReaderFor(txn, columnName),
+		writer:       txn.bufferFor(columnName),
+	}
 }
