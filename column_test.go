@@ -60,7 +60,7 @@ func testColumn(t *testing.T, column Column, value interface{}) {
 
 	// Assert the value
 	v, ok := column.Value(9)
-	assert.Equal(t, 1, column.Index().Count())
+	assert.Equal(t, 1, column.Index(0).Count())
 	assert.True(t, column.Contains(9))
 	assert.Equal(t, value, v)
 	assert.True(t, ok)
@@ -212,7 +212,7 @@ func applyChanges(column Column, updates ...Update) {
 
 	r := new(commit.Reader)
 	r.Seek(buf)
-	column.Apply(r)
+	column.Apply(0, r)
 }
 
 type Update struct {
@@ -308,7 +308,7 @@ func TestSnapshotBool(t *testing.T) {
 	rdr.Seek(buf)
 	output := ForBool()
 	output.Grow(8)
-	output.Apply(rdr)
+	output.Apply(0, rdr)
 	assert.Equal(t, input, output)
 }
 
@@ -333,22 +333,8 @@ func TestSnapshotIndex(t *testing.T) {
 	rdr.Seek(buf)
 	output := newIndex("test", "a", predicateFn)
 	output.Grow(8)
-	output.Apply(rdr)
+	output.Apply(0, rdr)
 	assert.Equal(t, input.Column.(*columnIndex).fill, output.Column.(*columnIndex).fill)
-}
-
-func TestResize(t *testing.T) {
-	assert.Equal(t, 1, resize(100, 0))
-	assert.Equal(t, 2, resize(100, 1))
-	assert.Equal(t, 4, resize(100, 2))
-	assert.Equal(t, 16, resize(100, 11))
-	assert.Equal(t, 256, resize(100, 255))
-	assert.Equal(t, 1232, resize(100, 1000))
-	assert.Equal(t, 1232, resize(200, 1000))
-	assert.Equal(t, 1232, resize(512, 1000))
-	assert.Equal(t, 1213, resize(500, 1000)) // Inconsistent
-	assert.Equal(t, 22504, resize(512, 20000))
-	assert.Equal(t, 28322, resize(22504, 22600))
 }
 
 func TestAccessors(t *testing.T) {
