@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/kelindar/column/commit"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -146,7 +147,7 @@ func TestIndexInvalid(t *testing.T) {
 		players.Query(func(txn *Txn) error {
 			invalid := txn.Float64("invalid-column")
 			return txn.Range(func(index uint32) {
-				invalid.Add(1)
+				invalid.Merge(1)
 			})
 		})
 	})
@@ -296,8 +297,8 @@ func TestIndexWithAtomicAdd(t *testing.T) {
 		balance := txn.Float64("balance")
 		for i := 0; i < 30; i++ {
 			txn.Range(func(index uint32) {
-				balance.Add(50.0)
-				balance.Add(50.0)
+				balance.Merge(50.0)
+				balance.Merge(50.0)
 			})
 		}
 		return nil
@@ -456,7 +457,7 @@ func TestUpdateAtNoChanges(t *testing.T) {
 	}))
 
 	assert.NoError(t, c.QueryAt(0, func(r Row) error {
-		r.txn.bufferFor("xxx").PutInt(123, 123)
+		r.txn.bufferFor("xxx").PutInt(commit.Put, 123, 123)
 		return nil
 	}))
 }
@@ -627,16 +628,16 @@ func TestRowMethods(t *testing.T) {
 		r.SetFloat64("float64", 1)
 
 		// Increment
-		r.AddInt("int", 1)
-		r.AddInt16("int16", 1)
-		r.AddInt32("int32", 1)
-		r.AddInt64("int64", 1)
-		r.AddUint("uint", 1)
-		r.AddUint16("uint16", 1)
-		r.AddUint32("uint32", 1)
-		r.AddUint64("uint64", 1)
-		r.AddFloat32("float32", 1)
-		r.AddFloat64("float64", 1)
+		r.MergeInt("int", 1)
+		r.MergeInt16("int16", 1)
+		r.MergeInt32("int32", 1)
+		r.MergeInt64("int64", 1)
+		r.MergeUint("uint", 1)
+		r.MergeUint16("uint16", 1)
+		r.MergeUint32("uint32", 1)
+		r.MergeUint64("uint64", 1)
+		r.MergeFloat32("float32", 1)
+		r.MergeFloat64("float64", 1)
 		return nil
 	})
 
@@ -722,6 +723,107 @@ func TestUnion(t *testing.T) {
 
 	c.Query(func(txn *Txn) error {
 		assert.Equal(t, 3, txn.Union("d_a_1", "d_a_2").Union("d_a_3").Count())
+		return nil
+	})
+}
+
+func TestWithUnion(t *testing.T) {
+	c := NewCollection()
+	c.CreateColumn("tester", ForString())
+	c.CreateColumn("testerB", ForString())
+
+	c.CreateIndex("tester_1", "tester", func(r Reader) bool { return r.String() == "1" })
+	c.CreateIndex("tester_2", "tester", func(r Reader) bool { return r.String() == "2" })
+	c.CreateIndex("tester_3", "tester", func(r Reader) bool { return r.String() == "3" })
+	c.CreateIndex("testerB_4", "testerB", func(r Reader) bool { return r.String() == "4" })
+	c.CreateIndex("testerB_5", "testerB", func(r Reader) bool { return r.String() == "5" })
+	c.CreateIndex("testerB_6", "testerB", func(r Reader) bool { return r.String() == "6" })
+
+	c.InsertObject(map[string]interface{}{
+		"tester": "1",
+		"testerB": "4",
+	})
+	c.InsertObject(map[string]interface{}{
+		"tester": "2",
+		"testerB": "5",
+	})
+	c.InsertObject(map[string]interface{}{
+		"tester": "3",
+		"testerB": "6",
+	})
+
+	// account for normal use-case
+	c.Query(func(txn *Txn) error {
+		txn.WithUnion("tester_1", "tester_2")
+		txn.Union("testerB_5", "testerB_6")
+
+		assert.Equal(t, 3, txn.Count())
+		return nil
+	})
+
+	// where tester in ['1', '2'] and testerB in ['5', '6']
+	c.Query(func(txn *Txn) error {
+		txn.Union("tester_1", "tester_2")
+		txn.WithUnion("testerB_5", "testerB_6")
+
+		assert.Equal(t, 1, txn.Count())
+		return nil
+	})
+
+	c.Query(func (txn *Txn) error {
+		txn.Without("tester_1", "testerB_5")
+		txn.WithUnion("tester_2", "tester_1", "tester_3")
+
+		assert.Equal(t, 1, txn.Count())
+		return nil
+	})
+}
+
+func TestWithUnionPlayers(t *testing.T) {
+	trueCount := 0
+	players := loadPlayers(100000)
+	
+	players.Query(func (txn *Txn) error {
+		ageCol := txn.Any("age")
+		raceCol := txn.Any("race")
+		classCol := txn.Any("class")
+
+		return txn.Range(func (i uint32) {
+			age, _ := ageCol.Get()
+			race, _ := raceCol.Get()
+			class, _ := classCol.Get()
+
+			if race == "dwarf" && (age.(float64) >= 30.0 || class == "mage") {
+				trueCount++
+			}
+		})
+	})
+
+	players.Query(func (txn *Txn) error {
+		txn.With("dwarf")
+		txn.WithUnion("mage", "old")
+
+		assert.Equal(t, trueCount, txn.Count())
+		return nil
+	})
+
+	players.Query(func (txn *Txn) error {
+		txn.With("dwarf", "mage", "old")
+		assert.True(t, txn.Count() < trueCount)
+		return nil
+	})
+
+	players.Query(func (txn *Txn) error {
+		txn.Union("dwarf", "mage", "old")
+		assert.True(t, txn.Count() > trueCount)
+		return nil
+	})
+
+	// dwarf & elf cancel out
+	players.Query(func (txn *Txn) error {
+		txn.With("dwarf")
+		txn.WithUnion("mage", "old", "elf")
+		assert.Equal(t, trueCount, txn.Count())
 		return nil
 	})
 }
