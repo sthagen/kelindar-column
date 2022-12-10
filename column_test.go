@@ -579,18 +579,31 @@ func TestRecord(t *testing.T) {
 	col := NewCollection()
 	col.CreateColumn("ts", ForRecord(func() *time.Time {
 		return new(time.Time)
-	}, nil))
+	}))
+	col.CreateIndex("recent", "ts", func(r Reader) bool {
+		var ts time.Time
+		if err := ts.UnmarshalBinary(r.Bytes()); err == nil {
+			return ts.After(time.Unix(1667745800, 0))
+		}
+		return false
+	})
 
 	// Insert the time, it implements binary marshaler
 	idx, _ := col.Insert(func(r Row) error {
-		now := time.Unix(1667745766, 0)
+		now := time.Unix(1667745700, 0)
 		r.SetRecord("ts", &now)
+		return nil
+	})
+
+	// Index should not have any recent
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.Without("recent").Count())
 		return nil
 	})
 
 	// We should be able to read back the time
 	col.QueryAt(idx, func(r Row) error {
-		now := time.Unix(1667745766, 0)
+		now := time.Unix(1667745900, 0)
 		r.MergeRecord("ts", &now)
 		return nil
 	})
@@ -602,6 +615,12 @@ func TestRecord(t *testing.T) {
 		assert.Equal(t, "November", ts.(*time.Time).UTC().Month().String())
 		return nil
 	})
+
+	// Merge should have updated the index as well
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.With("recent").Count())
+		return nil
+	})
 }
 
 func TestRecord_Errors(t *testing.T) {
@@ -609,7 +628,7 @@ func TestRecord_Errors(t *testing.T) {
 	col.CreateColumn("id", ForInt64())
 	col.CreateColumn("ts", ForRecord(func() *time.Time {
 		return new(time.Time)
-	}, nil))
+	}))
 
 	// Column "xxx" does not exist
 	assert.Panics(t, func() {
@@ -643,7 +662,7 @@ func TestRecordMerge_ErrDecode(t *testing.T) {
 		return mockRecord{
 			errDecode: true,
 		}
-	}, nil))
+	}))
 
 	// Insert the time, it implements binary marshaler
 	idx, _ := col.Insert(func(r Row) error {
@@ -664,7 +683,7 @@ func TestRecordMerge_ErrEncode(t *testing.T) {
 		return mockRecord{
 			errEncode: true,
 		}
-	}, nil))
+	}))
 
 	// Insert the time, it implements binary marshaler
 	idx, _ := col.Insert(func(r Row) error {
@@ -675,6 +694,42 @@ func TestRecordMerge_ErrEncode(t *testing.T) {
 	// Merge a record, but will fail on decode
 	col.QueryAt(idx, func(r Row) error {
 		assert.NoError(t, r.MergeRecord("record", mockRecord{}))
+		return nil
+	})
+}
+
+func TestNumberMerge(t *testing.T) {
+	col := NewCollection()
+	col.CreateColumn("age", ForInt32(WithMerge(func(v, d int32) int32 {
+		v -= d
+		return v
+	})))
+
+	col.CreateIndex("young", "age", func(r Reader) bool {
+		return r.Int() < 50
+	})
+
+	// Insert the time, it implements binary marshaler
+	idx, _ := col.Insert(func(r Row) error {
+		r.SetInt32("age", 100)
+		return nil
+	})
+
+	for i := 0; i < 7; i++ {
+		col.QueryAt(idx, func(r Row) error {
+			r.MergeInt32("age", 10)
+			return nil
+		})
+	}
+
+	col.QueryAt(idx, func(r Row) error {
+		age, _ := r.Int32("age")
+		assert.Equal(t, int32(30), age)
+		return nil
+	})
+
+	col.Query(func(txn *Txn) error {
+		assert.Equal(t, 1, txn.With("young").Count())
 		return nil
 	})
 }

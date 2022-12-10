@@ -12,8 +12,11 @@ import (
 
 // Reader represents a reader cursor for a specific row/column combination.
 type Reader interface {
+	IsUpsert() bool
+	IsDelete() bool
 	Index() uint32
 	String() string
+	Bytes() []byte
 	Float() float64
 	Int() int
 	Uint() uint
@@ -24,12 +27,12 @@ type Reader interface {
 // this so that we can feed it to the index transparently.
 var _ Reader = new(commit.Reader)
 
-// --------------------------- Index ----------------------------
-
 // computed represents a computed column
 type computed interface {
 	Column() string
 }
+
+// --------------------------- Index ----------------------------
 
 // columnIndex represents the index implementation
 type columnIndex struct {
@@ -65,7 +68,7 @@ func (c *columnIndex) Apply(chunk commit.Chunk, r *commit.Reader) {
 	// on the actual column.
 	for r.Next() {
 		switch r.Type {
-		case commit.Put, commit.Merge:
+		case commit.Put:
 			if c.rule(r) {
 				c.fill.Set(uint32(r.Offset))
 			} else {
@@ -98,4 +101,59 @@ func (c *columnIndex) Index(chunk commit.Chunk) bitmap.Bitmap {
 // Snapshot writes the entire column into the specified destination buffer
 func (c *columnIndex) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
 	dst.PutBitmap(commit.PutTrue, chunk, c.fill)
+}
+
+// --------------------------- Trigger ----------------------------
+
+// columnTrigger represents the trigger implementation
+type columnTrigger struct {
+	name string       // The name of the target column
+	clbk func(Reader) // The trigger callback
+}
+
+// newTrigger creates a new trigger column.
+func newTrigger(indexName, columnName string, callback func(r Reader)) *column {
+	return columnFor(indexName, &columnTrigger{
+		name: columnName,
+		clbk: callback,
+	})
+}
+
+// Grow grows the size of the column until we have enough to store
+func (c *columnTrigger) Grow(idx uint32) {
+	// Noop
+}
+
+// Column returns the target name of the column on which this index should apply.
+func (c *columnTrigger) Column() string {
+	return c.name
+}
+
+// Apply applies a set of operations to the column.
+func (c *columnTrigger) Apply(chunk commit.Chunk, r *commit.Reader) {
+	for r.Next() {
+		if r.Type == commit.Put || r.Type == commit.Delete {
+			c.clbk(r)
+		}
+	}
+}
+
+// Value retrieves a value at a specified index.
+func (c *columnTrigger) Value(idx uint32) (v any, ok bool) {
+	return nil, false
+}
+
+// Contains checks whether the column has a value at a specified index.
+func (c *columnTrigger) Contains(idx uint32) bool {
+	return false
+}
+
+// Index returns the fill list for the column
+func (c *columnTrigger) Index(chunk commit.Chunk) bitmap.Bitmap {
+	return nil
+}
+
+// Snapshot writes the entire column into the specified destination buffer
+func (c *columnTrigger) Snapshot(chunk commit.Chunk, dst *commit.Buffer) {
+	// Noop
 }

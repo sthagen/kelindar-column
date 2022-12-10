@@ -135,8 +135,8 @@ func run(name string, b *testing.B, count int, fn func(buf *Buffer, r *Reader)) 
 }
 
 func TestSizeof(t *testing.T) {
-	assert.LessOrEqual(t, int(unsafe.Sizeof(Reader{})), 80)
-	assert.LessOrEqual(t, int(unsafe.Sizeof(Buffer{})), 80)
+	assert.Equal(t, 96, int(unsafe.Sizeof(Reader{})))
+	assert.Equal(t, 80, int(unsafe.Sizeof(Buffer{})))
 }
 
 func TestReadWrite(t *testing.T) {
@@ -304,5 +304,25 @@ func TestBufferReadFromFailures(t *testing.T) {
 		output := NewBuffer(0)
 		_, err := output.ReadFrom(bytes.NewReader(buffer.Bytes()[:size]))
 		assert.Error(t, err)
+	}
+}
+
+func FuzzBufferString(f *testing.F) {
+	f.Add(uint32(1), "test")
+
+	f.Fuzz(func(t *testing.T, i uint32, v string) {
+		buf := NewBuffer(0)
+		buf.PutString(Put, i, v)
+
+		r := NewReader()
+		r.Seek(buf)
+		assert.True(t, r.Next())
+		assert.Equal(t, v, r.String())
+	})
+}
+
+func TestOpString(t *testing.T) {
+	for i := 0; i < 255; i++ {
+		assert.NotEmpty(t, OpType(i).String())
 	}
 }
