@@ -10,7 +10,9 @@ require (
 	github.com/kelindar/smutex v1.0.0
 	github.com/klauspost/compress v1.15.12
 	github.com/stretchr/testify v1.8.1
+	github.com/tidwall/btree v1.6.0
 	github.com/zeebo/xxh3 v1.0.2
+
 )
 
 require (

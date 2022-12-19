@@ -239,7 +239,7 @@ func (c *Collection) DropTrigger(triggerName string) error {
 }
 
 // CreateIndex creates an index column with a specified name which depends on a given
-// column. The index function will be applied on the values of the column whenever
+// data column. The index function will be applied on the values of the column whenever
 // a new row is added or updated.
 func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader) bool) error {
 	if fn == nil || columnName == "" || indexName == "" {
@@ -256,6 +256,47 @@ func (c *Collection) CreateIndex(indexName, columnName string, fn func(r Reader)
 	index := newIndex(indexName, columnName, fn)
 	c.lock.Lock()
 	index.Grow(uint32(c.opts.Capacity))
+	c.cols.Store(indexName, index)
+	c.cols.Store(columnName, column, index)
+	c.lock.Unlock()
+
+	// Iterate over all of the values of the target column, chunk by chunk and fill
+	// the index accordingly.
+	chunks := c.chunks()
+	buffer := commit.NewBuffer(c.Count())
+	reader := commit.NewReader()
+	for chunk := commit.Chunk(0); int(chunk) < chunks; chunk++ {
+		if column.Snapshot(chunk, buffer) {
+			reader.Seek(buffer)
+			index.Apply(chunk, reader)
+		}
+	}
+
+	return nil
+}
+
+// CreateSortIndex creates a sorted index column with a specified name which depends
+// on a given data column.
+func (c *Collection) CreateSortIndex(indexName, columnName string) error {
+	if columnName == "" || indexName == "" {
+		return fmt.Errorf("column: create index must specify name & column")
+	}
+
+	// Prior to creating an index, we should have a column
+	column, ok := c.cols.Load(columnName)
+	if !ok {
+		return fmt.Errorf("column: unable to create index, column '%v' does not exist", columnName)
+	}
+
+	// Check to make sure index does not already exist
+	_, ok = c.cols.Load(indexName)
+	if ok {
+		return fmt.Errorf("column: unable to create index, index '%v' already exist", indexName)
+	}
+
+	// Create and add the index column,
+	index := newSortIndex(indexName, columnName)
+	c.lock.Lock()
 	c.cols.Store(indexName, index)
 	c.cols.Store(columnName, column, index)
 	c.lock.Unlock()
