@@ -734,6 +734,52 @@ func TestNumberMerge(t *testing.T) {
 	})
 }
 
+func TestIssue87(t *testing.T) {
+	table := NewCollection()
+	table.CreateColumn("birthdate", ForRecord(func() *time.Time { return new(time.Time) }))
+
+	srcDate := time.Date(1999, 3, 2, 12, 0, 0, 0, time.Local)
+	table.Insert(func(r Row) error {
+		r.SetRecord("birthdate", srcDate)
+		return nil
+	})
+
+	table.Query(func(txn *Txn) error {
+		assert.Equal(t, txn.WithValue("birthdate", func(v any) bool {
+			return v.(*time.Time).Equal(srcDate)
+		}).Count(), 1)
+		return nil
+	})
+}
+
+// Tests the case where a column is created after inserting a large enough amount of data
+func TestIssue89(t *testing.T) {
+	coll := NewCollection()
+	coll.CreateColumn("foo", ForString())
+
+	// Should be larger than a single chunk
+	for i := 0; i < 16385; i++ {
+		coll.Insert(func(row Row) error {
+			row.SetString("foo", fmt.Sprintf("foo-%d", i))
+			return nil
+		})
+	}
+
+	// set up a derived column of data, over initial capacity
+	coll.CreateColumn("bar", ForString())
+	assert.NoError(t, coll.Query(func(txn *Txn) error {
+		src := txn.String("foo")
+		dest := txn.String("bar")
+		return txn.Range(func(_ uint32) {
+			value, ok := src.Get()
+			assert.True(t, ok)
+			dest.Set("bar-" + value[4:])
+		})
+	}))
+
+	assert.Equal(t, 16385, coll.Count())
+}
+
 func invoke(any interface{}, name string, args ...interface{}) []reflect.Value {
 	inputs := make([]reflect.Value, len(args))
 	for i := range args {

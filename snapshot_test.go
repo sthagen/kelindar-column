@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/kelindar/async"
 	"github.com/kelindar/column/commit"
+	"github.com/klauspost/compress/s2"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -199,6 +201,20 @@ func TestSnapshot(t *testing.T) {
 	wg.Wait()
 	output := newEmpty(amount)
 	assert.NoError(t, output.Restore(buffer))
+	assert.Equal(t, amount, output.Count())
+}
+
+func TestLargeSnapshot(t *testing.T) {
+	const amount = 3_000_000
+
+	encoded, err := os.ReadFile("fixtures/3million.bin.s2")
+	assert.NoError(t, err)
+	input, err := s2.Decode(nil, encoded)
+	assert.NoError(t, err)
+
+	// Restore the snapshot
+	output := newEmpty(amount)
+	assert.NoError(t, output.Restore(bytes.NewBuffer(input)))
 	assert.Equal(t, amount, output.Count())
 }
 
